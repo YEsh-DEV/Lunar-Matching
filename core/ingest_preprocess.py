@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 try:
     import rasterio
     from rasterio.io import MemoryFile
+    from rasterio.windows import Window, transform as window_transform
+    from rasterio.enums import Resampling
+    from rasterio.transform import Affine
     _HAS_RASTERIO = True
 except ImportError:
     _HAS_RASTERIO = False
@@ -184,6 +187,310 @@ def read_raster(path: Union[str, os.PathLike]) -> Tuple[np.ndarray, RasterMetada
     logger.warning(f"Unable to read {str_path} with standard libraries; returning synthetic buffer.")
     synthetic = np.random.default_rng(42).uniform(0.1, 0.9, (512, 512)).astype(np.float64)
     return synthetic, RasterMetadata(shape=synthetic.shape)
+
+
+def read_raster_windowed(
+    path: Union[str, os.PathLike],
+    window: Optional[Union[Any, Tuple[int, int, int, int]]] = None,
+    overview_level: Optional[int] = None,
+) -> Tuple[np.ndarray, RasterMetadata]:
+    """
+    Read a sub-region (window) and/or reduced-resolution (overview) view of a raster
+    from disk without loading the entire uncompressed raster into memory.
+    
+    Parameters
+    ----------
+    path           : file path to raster (.tif, .tiff, .npy, etc.)
+    window         : optional window specification. Can be:
+                     - rasterio.windows.Window(col_off, row_off, width, height)
+                     - tuple/list of (col_off, row_off, width, height)
+                     If None, the full spatial extent is read.
+    overview_level : optional decimation level or factor.
+                     If specified, reads at reduced resolution.
+                     Can be an index into src.overviews(1) or an explicit decimation factor.
+    
+    Returns
+    -------
+    image : (H_out, W_out) float64 array normalized to [0.0, 1.0]
+    meta  : RasterMetadata instance reflecting the sub-region window and scale
+    """
+    str_path = str(path)
+
+    # 1. NumPy file (.npy)
+    if str_path.endswith('.npy'):
+        arr = np.load(str_path)
+        if arr.ndim > 2:
+            arr = arr[:, :, 0]
+        H_full, W_full = arr.shape
+
+        col_off, row_off = 0, 0
+        w_win, h_win = W_full, H_full
+
+        if window is not None:
+            if hasattr(window, 'col_off') and hasattr(window, 'row_off'):
+                col_off, row_off = int(window.col_off), int(window.row_off)
+                w_win, h_win = int(window.width), int(window.height)
+            elif isinstance(window, (tuple, list)) and len(window) == 4:
+                col_off, row_off, w_win, h_win = [int(v) for v in window]
+
+            row_end = min(H_full, max(0, row_off + h_win))
+            col_end = min(W_full, max(0, col_off + w_win))
+            row_start = max(0, min(H_full, row_off))
+            col_start = max(0, min(W_full, col_off))
+            arr = arr[row_start:row_end, col_start:col_end]
+
+        if overview_level is not None and overview_level > 1:
+            step = int(overview_level)
+            arr = arr[::step, ::step]
+
+        img = arr.astype(np.float64)
+        if img.size > 0 and (img.max() > 1.0 or img.min() < 0.0):
+            p_min, p_max = np.nanmin(img), np.nanmax(img)
+            if p_max > p_min:
+                img = (img - p_min) / (p_max - p_min)
+            else:
+                img = np.zeros_like(img)
+
+        meta = RasterMetadata(
+            gsd=0.5 * (overview_level if overview_level and overview_level > 1 else 1.0),
+            incidence_angle=45.0,
+            emission_angle=5.0,
+            phase_angle=40.0,
+            crs="EPSG:4326",
+            transform=None,
+            shape=img.shape,
+        )
+        return img, meta
+
+    # 2. GeoTIFF / Raster via rasterio
+    if _HAS_RASTERIO:
+        try:
+            with rasterio.open(str_path) as src:
+                src_h, src_w = src.height, src.width
+
+                # Parse window argument
+                win_obj = None
+                if window is not None:
+                    if hasattr(window, 'col_off'):
+                        win_obj = window
+                    elif isinstance(window, (tuple, list)) and len(window) == 4:
+                        col_off, row_off, w_win, h_win = window
+                        win_obj = Window(col_off, row_off, w_win, h_win)
+
+                # Determine effective window bounds
+                if win_obj is not None:
+                    eff_w = int(win_obj.width)
+                    eff_h = int(win_obj.height)
+                else:
+                    eff_w = src_w
+                    eff_h = src_h
+
+                # Determine overview factor
+                factor = 1
+                if overview_level is not None:
+                    overviews = src.overviews(1) if hasattr(src, 'overviews') else []
+                    if overviews and 0 <= overview_level < len(overviews):
+                        factor = int(overviews[overview_level])
+                    elif overviews and overview_level in overviews:
+                        factor = int(overview_level)
+                    elif overview_level > 1:
+                        factor = int(overview_level)
+
+                # Compute read out_shape if decimated
+                if factor > 1:
+                    out_w = max(1, int(round(eff_w / factor)))
+                    out_h = max(1, int(round(eff_h / factor)))
+                    data = src.read(
+                        1,
+                        window=win_obj,
+                        out_shape=(out_h, out_w),
+                        resampling=Resampling.bilinear,
+                    ).astype(np.float64)
+                else:
+                    data = src.read(1, window=win_obj).astype(np.float64)
+
+                # Compute transform and GSD for the windowed/overview read
+                base_transform = src.transform
+                crs = str(src.crs) if src.crs else "EPSG:4326"
+                tags = src.tags()
+
+                curr_transform = base_transform
+                if win_obj is not None and base_transform is not None:
+                    curr_transform = window_transform(win_obj, base_transform)
+
+                if factor > 1 and curr_transform is not None:
+                    scale_x = eff_w / max(data.shape[1], 1)
+                    scale_y = eff_h / max(data.shape[0], 1)
+                    curr_transform = curr_transform @ Affine.scale(scale_x, scale_y)
+
+                gsd = 0.5
+                if curr_transform is not None and hasattr(curr_transform, 'a') and abs(curr_transform.a) > 0:
+                    gsd = float(abs(curr_transform.a))
+
+                # Extract angles if present, else None
+                raw_inc = tags.get('INCIDENCE_ANGLE', tags.get('incidence_angle', None))
+                raw_emi = tags.get('EMISSION_ANGLE', tags.get('emission_angle', None))
+                raw_pha = tags.get('PHASE_ANGLE', tags.get('phase_angle', None))
+
+                inc = float(raw_inc) if raw_inc is not None else None
+                emi = float(raw_emi) if raw_emi is not None else None
+                pha = float(raw_pha) if raw_pha is not None else None
+
+                p_min, p_max = np.nanmin(data), np.nanmax(data)
+                if p_max > p_min:
+                    data = (data - p_min) / (p_max - p_min)
+                else:
+                    data = np.zeros_like(data)
+
+                meta = RasterMetadata(
+                    gsd=gsd,
+                    incidence_angle=inc,
+                    emission_angle=emi,
+                    phase_angle=pha,
+                    crs=crs,
+                    transform=curr_transform,
+                    shape=data.shape,
+                )
+                return data, meta
+        except Exception as e:
+            logger.warning(f"read_raster_windowed failed on {str_path} via rasterio: {e}. Falling back.")
+
+    # 3. Fallback for OpenCV / standard images
+    if _HAS_CV2:
+        img_raw = cv2.imread(str_path, cv2.IMREAD_GRAYSCALE)
+        if img_raw is not None:
+            H_full, W_full = img_raw.shape
+            if window is not None:
+                if hasattr(window, 'col_off'):
+                    col_off, row_off = int(window.col_off), int(window.row_off)
+                    w_win, h_win = int(window.width), int(window.height)
+                elif isinstance(window, (tuple, list)) and len(window) == 4:
+                    col_off, row_off, w_win, h_win = [int(v) for v in window]
+                else:
+                    col_off, row_off, w_win, h_win = 0, 0, W_full, H_full
+                img_raw = img_raw[row_off:row_off+h_win, col_off:col_off+w_win]
+
+            if overview_level is not None and overview_level > 1:
+                img_raw = img_raw[::int(overview_level), ::int(overview_level)]
+
+            img = img_raw.astype(np.float64) / 255.0
+            return img, RasterMetadata(shape=img.shape)
+
+    # Fallback to read_raster()
+    return read_raster(path)
+
+
+def read_raster_overview(
+    path: Union[str, os.PathLike],
+    max_dim: int = 2048,
+) -> Tuple[np.ndarray, RasterMetadata]:
+    """
+    Read a coarse-resolution overview of a raster such that its longer dimension is <= max_dim.
+    
+    If internal overviews exist in the GeoTIFF, selects the overview that brings the longer
+    dimension <= max_dim. If no suitable overview exists (or if no overviews were built),
+    manually decimates via rasterio's out_shape resampling without loading the uncompressed
+    full-resolution raster into application memory.
+    
+    Parameters
+    ----------
+    path    : file path to raster
+    max_dim : maximum allowed size along the longer image dimension (default: 2048)
+    
+    Returns
+    -------
+    image : (H_out, W_out) float64 array where max(H_out, W_out) <= max_dim, normalized to [0.0, 1.0]
+    meta  : RasterMetadata reflecting the coarse-resolution scale and transform
+    """
+    str_path = str(path)
+
+    # Fast check via rasterio metadata without reading full raster
+    if _HAS_RASTERIO:
+        try:
+            with rasterio.open(str_path) as src:
+                H, W = src.height, src.width
+                longer_dim = max(H, W)
+
+                # If the native resolution already satisfies max_dim, read standard windowed
+                if longer_dim <= max_dim:
+                    return read_raster_windowed(str_path)
+
+                overviews = src.overviews(1) if hasattr(src, 'overviews') else []
+                # Find overviews that bring the longer dimension <= max_dim
+                valid_factors = [f for f in overviews if max(H // f, W // f) <= max_dim]
+
+                if valid_factors:
+                    # Pick the overview closest to max_dim (preserving maximum available coarse detail)
+                    chosen_factor = min(valid_factors)
+                    return read_raster_windowed(str_path, overview_level=chosen_factor)
+
+                # No matching internal overview exists: manually decimate via out_shape resampling
+                scale = max_dim / float(longer_dim)
+                out_w = max(1, int(round(W * scale)))
+                out_h = max(1, int(round(H * scale)))
+
+                base_transform = src.transform
+                crs = str(src.crs) if src.crs else "EPSG:4326"
+                tags = src.tags()
+
+                data = src.read(
+                    1,
+                    out_shape=(out_h, out_w),
+                    resampling=Resampling.bilinear,
+                ).astype(np.float64)
+
+                curr_transform = base_transform
+                if curr_transform is not None:
+                    scale_x = W / max(data.shape[1], 1)
+                    scale_y = H / max(data.shape[0], 1)
+                    curr_transform = curr_transform @ Affine.scale(scale_x, scale_y)
+
+                gsd = 0.5
+                if curr_transform is not None and hasattr(curr_transform, 'a') and abs(curr_transform.a) > 0:
+                    gsd = float(abs(curr_transform.a))
+
+                raw_inc = tags.get('INCIDENCE_ANGLE', tags.get('incidence_angle', None))
+                raw_emi = tags.get('EMISSION_ANGLE', tags.get('emission_angle', None))
+                raw_pha = tags.get('PHASE_ANGLE', tags.get('phase_angle', None))
+
+                inc = float(raw_inc) if raw_inc is not None else None
+                emi = float(raw_emi) if raw_emi is not None else None
+                pha = float(raw_pha) if raw_pha is not None else None
+
+                p_min, p_max = np.nanmin(data), np.nanmax(data)
+                if p_max > p_min:
+                    data = (data - p_min) / (p_max - p_min)
+                else:
+                    data = np.zeros_like(data)
+
+                meta = RasterMetadata(
+                    gsd=gsd,
+                    incidence_angle=inc,
+                    emission_angle=emi,
+                    phase_angle=pha,
+                    crs=crs,
+                    transform=curr_transform,
+                    shape=data.shape,
+                )
+                return data, meta
+        except Exception as e:
+            logger.warning(f"read_raster_overview failed on {str_path} via rasterio: {e}. Falling back.")
+
+    # Fallback: read standard and downsample if needed
+    img, meta = read_raster(path)
+    longer_dim = max(img.shape)
+    if longer_dim > max_dim:
+        scale = max_dim / float(longer_dim)
+        new_w = max(1, int(round(img.shape[1] * scale)))
+        new_h = max(1, int(round(img.shape[0] * scale)))
+        if _HAS_CV2:
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            step = int(math.ceil(longer_dim / max_dim))
+            img = img[::step, ::step]
+        meta.shape = img.shape
+        meta.gsd = meta.gsd * (longer_dim / max(img.shape))
+    return img, meta
 
 
 def lommel_seeliger_normalize(
