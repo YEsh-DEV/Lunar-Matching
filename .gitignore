@@ -67,7 +67,11 @@ image copy*.png
 *.pt
 *.onnx
 *.bin
-!models/loftr_weights/.gitkeep
+models/
+
+# Test suite and demo output
+demo_output/
+tests/
 
 # Environment variables
 .env
