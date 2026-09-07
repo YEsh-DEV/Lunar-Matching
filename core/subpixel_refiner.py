@@ -54,6 +54,7 @@ def lucas_kanade_refine(
     min_eigenvalue: float = 1e-6,
     convergence_threshold: float = 0.03,
     max_shift: float = 1.0,
+    return_info: bool = False,
 ) -> tuple:
     """
     Refine correspondence via Lucas-Kanade gradient descent.
@@ -65,15 +66,25 @@ def lucas_kanade_refine(
     We hold F fixed (template from img_f at point (x_a, y_a)) and
     iteratively shift the sampling position in img_g by (Δx, Δy).
 
-    Returns (x_b_refined, y_b_refined, converged).
+    Returns (x_b_refined, y_b_refined, converged) or
+    (x_b_refined, y_b_refined, converged, info_dict) if return_info=True.
     """
     x_a, y_a, x_b, y_b = float(point[0]), float(point[1]), float(point[2]), float(point[3])
     half = patch_size // 2
 
+    info = {
+        'iterations': 0,
+        'delta_mag': 0.0,
+        'total_shift': 0.0,
+        'reason': 'uninitialized',
+        'min_eig': 0.0,
+    }
+
     # Fixed reference template from image A
     patch_f = _sample_patch_bilinear(img_f, x_a, y_a, half)
     if patch_f is None:
-        return x_b, y_b, False
+        info['reason'] = 'boundary_template'
+        return (x_b, y_b, False, info) if return_info else (x_b, y_b, False)
 
     # Gradients computed from reference template (constant across iterations)
     Ix, Iy = _image_gradients(patch_f)
@@ -90,19 +101,24 @@ def lucas_kanade_refine(
     trace = H11 + H22
     disc  = max((H11 - H22) ** 2 + 4 * H12 ** 2, 0.0)
     min_eig = 0.5 * (trace - np.sqrt(disc))
+    info['min_eig'] = float(min_eig)
 
     if min_eig < min_eigenvalue or abs(det) < 1e-12:
-        return x_b, y_b, False
+        info['reason'] = 'low_eigenvalue'
+        return (x_b, y_b, False, info) if return_info else (x_b, y_b, False)
 
     # Precompute H^{-1}
     H_inv = np.array([[H22, -H12], [-H12, H11]], dtype=np.float64) / det
 
     cx, cy = x_b, y_b
+    converged_by_threshold = False
 
-    for _ in range(iterations):
+    for it in range(iterations):
+        info['iterations'] = it + 1
         patch_g = _sample_patch_bilinear(img_g, cx, cy, half)
         if patch_g is None:
-            break
+            info['reason'] = 'boundary_target'
+            return (x_b, y_b, False, info) if return_info else (x_b, y_b, False)
 
         # Error: G(cx,cy) - F(x_a,y_a)
         diff = (patch_g - patch_f).ravel()
@@ -115,19 +131,28 @@ def lucas_kanade_refine(
         delta_x = H_inv[0, 0] * b1 + H_inv[0, 1] * b2
         delta_y = H_inv[1, 0] * b1 + H_inv[1, 1] * b2
 
-        # Correct sign: b=Σ Ix*(G-F) gives negative update for a positive shift,
-        # so we SUBTRACT to move the sampling position toward the true location.
         cx -= delta_x
         cy -= delta_y
 
-        # Divergence guard: subpixel refinement must not drift beyond max_shift
-        if np.hypot(cx - x_b, cy - y_b) > max_shift:
-            return x_b, y_b, False
+        step_mag = float(np.hypot(delta_x, delta_y))
+        shift_mag = float(np.hypot(cx - x_b, cy - y_b))
+        info['delta_mag'] = step_mag
+        info['total_shift'] = shift_mag
 
-        if np.sqrt(delta_x ** 2 + delta_y ** 2) < convergence_threshold:
+        # Divergence guard: subpixel refinement must not drift beyond max_shift
+        if shift_mag > max_shift:
+            info['reason'] = 'exceeded_max_shift'
+            return (x_b, y_b, False, info) if return_info else (x_b, y_b, False)
+
+        if step_mag < convergence_threshold:
+            converged_by_threshold = True
+            info['reason'] = 'converged_threshold'
             break
 
-    return cx, cy, True
+    if not converged_by_threshold and info['reason'] == 'uninitialized':
+        info['reason'] = 'iteration_cap'
+
+    return (cx, cy, True, info) if return_info else (cx, cy, True)
 
 
 def refine_all_matches(
@@ -152,19 +177,65 @@ def refine_all_matches(
     refined = matches.copy()
     n_ok = n_fail = 0
 
+    counts = {
+        'converged_threshold': 0,
+        'iteration_cap': 0,
+        'exceeded_max_shift': 0,
+        'low_eigenvalue': 0,
+        'boundary': 0,
+    }
+    non_converged_samples = []
+
     for i in range(len(matches)):
         x1, y1, x2, y2, conf = matches[i]
-        x2r, y2r, ok = lucas_kanade_refine(
+        x2r, y2r, ok, info = lucas_kanade_refine(
             img_a_n, img_b_n, (x1, y1, x2, y2),
             patch_size=patch_size, iterations=iterations,
             max_shift=max_shift,
+            return_info=True,
         )
         refined[i, 2] = x2r
         refined[i, 3] = y2r
         if ok:
             n_ok += 1
+            if info['reason'] == 'converged_threshold':
+                counts['converged_threshold'] += 1
+            else:
+                counts['iteration_cap'] += 1
         else:
             n_fail += 1
+            reason = info['reason']
+            if reason in ('boundary_template', 'boundary_target'):
+                counts['boundary'] += 1
+            elif reason == 'low_eigenvalue':
+                counts['low_eigenvalue'] += 1
+            elif reason == 'exceeded_max_shift':
+                counts['exceeded_max_shift'] += 1
+            else:
+                counts['exceeded_max_shift'] += 1
+
+            if len(non_converged_samples) < 10:
+                non_converged_samples.append({
+                    'idx': i,
+                    'iterations': info['iterations'],
+                    'delta_mag': info['delta_mag'],
+                    'total_shift': info['total_shift'],
+                    'reason': info['reason'],
+                })
 
     logger.info(f"LK refinement: {n_ok}/{len(matches)} converged, {n_fail} kept original.")
+    logger.info(
+        f"LK breakdown: {counts['converged_threshold']} hit threshold (<0.03px), "
+        f"{counts['iteration_cap']} reached iter cap, "
+        f"{counts['exceeded_max_shift']} exceeded max_shift ({max_shift}px), "
+        f"{counts['low_eigenvalue']} low eigenvalue, {counts['boundary']} boundary."
+    )
+    if non_converged_samples:
+        samples_detail = "; ".join(
+            f"pt#{s['idx']}: iter={s['iterations']}, final_delta={s['delta_mag']:.4f}px, "
+            f"shift={s['total_shift']:.4f}px, reason={s['reason']}"
+            for s in non_converged_samples[:5]
+        )
+        logger.info(f"LK non-converged sample (first {min(5, len(non_converged_samples))}): {samples_detail}")
+
     return refined

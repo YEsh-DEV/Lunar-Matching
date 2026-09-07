@@ -5,6 +5,8 @@
 **Team:** Vadapav  
 **Target:** Working hackathon prototype with credible technical depth
 
+> **Note:** `LUNA-MATCH-Backend-Plan.md` uses the file/folder naming convention actually implemented in `core/`, `pipeline/`, and `api/`. Refer to that document for the canonical module layout.
+
 ---
 
 ## 1. Executive Summary

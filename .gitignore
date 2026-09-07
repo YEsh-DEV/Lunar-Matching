@@ -71,7 +71,6 @@ models/
 
 # Test suite and demo output
 demo_output/
-tests/
 
 # Environment variables
 .env

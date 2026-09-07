@@ -72,12 +72,13 @@ class LunaMatchPipeline:
         result   = pipeline.run()
     """
 
-    def __init__(self, job_id: str, img_a_path: str, img_b_path: str):
-        self.job_id     = job_id
-        self.img_a_path = img_a_path
-        self.img_b_path = img_b_path
-        self._state     = JobState.PENDING
-        self._start_time = time.time()
+    def __init__(self, job_id: str, img_a_path: str, img_b_path: str, matching_method: str = "classical"):
+        self.job_id          = job_id
+        self.img_a_path      = img_a_path
+        self.img_b_path      = img_b_path
+        self.matching_method = matching_method
+        self._state          = JobState.PENDING
+        self._start_time     = time.time()
 
         # Paths (interface contract)
         base = Path("data") / "jobs" / job_id
@@ -88,6 +89,8 @@ class LunaMatchPipeline:
             'intermediate'       : base / "intermediate",
             'pc_map_a'           : base / "intermediate" / "pc_map_a.npy",
             'mim_a'              : base / "intermediate" / "mim_a.npy",
+            'pc_map_b'           : base / "intermediate" / "pc_map_b.npy",
+            'mim_b'              : base / "intermediate" / "mim_b.npy",
             'matches_raw'        : base / "intermediate" / "matches_raw.npy",
             'matches_anms'       : base / "intermediate" / "matches_anms.npy",
             'matches_verified'   : base / "intermediate" / "matches_verified.npy",
@@ -152,12 +155,18 @@ class LunaMatchPipeline:
             img_a, img_b = align_gsd(img_a, img_b, meta_a, meta_b)
 
             # Save combined metadata
-            combined_meta = {'image_a': meta_a, 'image_b': meta_b}
+            meta_dict = {
+                'img_a_path': str(self.img_a_path),
+                'img_b_path': str(self.img_b_path),
+                'image_a': {kk: str(vv) for kk, vv in meta_a.items()},
+                'image_b': {kk: str(vv) for kk, vv in meta_b.items()},
+            }
             with open(self.paths['metadata'], 'w') as f:
-                json.dump(
-                    {k: {kk: str(vv) for kk, vv in v.items()} for k, v in combined_meta.items()},
-                    f, indent=2
-                )
+                json.dump(meta_dict, f, indent=2)
+
+            paths_json = self.paths['base'] / "input" / "input_paths.json"
+            with open(paths_json, 'w') as f:
+                json.dump({'img_a_path': str(self.img_a_path), 'img_b_path': str(self.img_b_path)}, f, indent=2)
 
         except Exception as e:
             err = f"Step 1 (Ingestion) failed: {traceback.format_exc()}"
@@ -171,8 +180,11 @@ class LunaMatchPipeline:
         try:
             logger.info(f"[{self.job_id}] Step 2: Phase Congruency & MIM")
             feats_a = extract_structural_features(img_a)
+            feats_b = extract_structural_features(img_b)
             self._save_npy(self.paths['pc_map_a'], feats_a['pc_map'])
             self._save_npy(self.paths['mim_a'],    feats_a['mim'])
+            self._save_npy(self.paths['pc_map_b'], feats_b['pc_map'])
+            self._save_npy(self.paths['mim_b'],    feats_b['mim'])
 
         except Exception as e:
             err = f"Step 2 (Phase Congruency) failed: {traceback.format_exc()}"
@@ -185,9 +197,9 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         try:
             self._write_status(JobState.MATCHING)
-            logger.info(f"[{self.job_id}] Step 3: Dense Matching")
+            logger.info(f"[{self.job_id}] Step 3: Dense Matching (method={self.matching_method})")
 
-            matches_raw = run_dense_matching(img_a, img_b)
+            matches_raw = run_dense_matching(img_a, img_b, method=self.matching_method)
 
             if matches_raw is None or len(matches_raw) < 8:
                 n_matches = 0 if matches_raw is None else len(matches_raw)
