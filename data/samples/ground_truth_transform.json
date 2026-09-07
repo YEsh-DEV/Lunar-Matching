@@ -1,0 +1,43 @@
+{
+  "dataset": "LUNA-MATCH Verified Ground-Truth Pair",
+  "base_image": "image.png",
+  "rotation_deg": 8.0,
+  "scale_factor": 0.6,
+  "translation_dx_px": 15.0,
+  "translation_dy_px": -10.0,
+  "center_x_px": 278.0,
+  "center_y_px": 218.5,
+  "photometric_gain": 1.25,
+  "photometric_bias": 10.0,
+  "gsd_a_m_per_px": 131.6,
+  "gsd_b_m_per_px": 219.3333,
+  "ground_truth_transform_3x3": [
+    [
+      0.5941608412449422,
+      0.08350386057603926,
+      109.5776925980415
+    ],
+    [
+      -0.08350386057603926,
+      0.5941608412449422,
+      101.88992942811905
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "affine_2x3": [
+    [
+      0.5941608412449422,
+      0.08350386057603926,
+      109.5776925980415
+    ],
+    [
+      -0.08350386057603926,
+      0.5941608412449422,
+      101.88992942811905
+    ]
+  ]
+}

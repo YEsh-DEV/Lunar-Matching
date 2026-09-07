@@ -1,0 +1,11 @@
+{
+  "status": "DONE",
+  "rmse_px": 0.3511,
+  "inlier_ratio": 0.8552,
+  "sdi": 0.8893,
+  "n_inliers": 561,
+  "n_total": 656,
+  "elapsed_s": 0.8,
+  "transform": "homography",
+  "is_synthetic_fallback": false
+}
