@@ -3,8 +3,7 @@ numpy==2.5.3
 scipy==1.18.1
 
 # Computer vision & image processing
-opencv-python==5.0.0.93
-opencv-contrib-python==5.0.0.93
+opencv-python-headless==5.0.0.93
 rasterio==1.5.1
 
 # Deep learning (optional - LoFTR via kornia) - install separately if needed

@@ -1,0 +1,12 @@
+.venv312
+.venvs
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+demo_output
+data/jobs/*
+!data/jobs/.gitkeep
+.git
+sampledataset
+.env

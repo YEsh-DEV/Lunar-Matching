@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: luna-match-engine
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
