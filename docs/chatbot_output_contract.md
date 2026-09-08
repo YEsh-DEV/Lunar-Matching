@@ -1,5 +1,5 @@
 # LUNA-MATCH Unified Chatbot & VLM/RAG Output Contract
-**Schema Version:** `1.0`  
+**Schema Version:** `1.1`  
 **API Endpoint:** `GET /jobs/{job_id}/summary`  
 **Purpose:** Standardized interface contract for external Large Language Models (LLMs), Vision-Language Models (VLMs), and Retrieval-Augmented Generation (RAG) agents querying lunar registration job status, quantitative metrics, plain-language diagnostic assessments, and visual verification artifacts.
 
@@ -11,7 +11,7 @@ When an external consumer or agent (e.g., Gemini 1.5 Pro, GPT-4o, Claude 3.5 Son
 1. **Mathematical Validation**: Ground-truth geodetic metrics (RMSE, inlier ratio, spatial dispersion).
 2. **Plain-Language Synthesis**: Quality classification with human-understandable reasoning for whether the registration is trustworthy or degraded.
 3. **Multi-Modal Visual Anchors**: Relative paths to visual verification products (checkerboard mosaic, tie-point correspondence map, residual heatmap, registered GeoTIFF) for visual QA.
-4. **Mission Context**: Sensor GSDs, scale disparity ratio, and whether photometric illumination corrections were applied.
+4. **Mission Context**: Sensor GSDs, scale disparity ratio, fallback pixel dimension ratio, and whether photometric illumination corrections were applied.
 
 The endpoint `GET /jobs/{job_id}/summary` returns a single, unified JSON payload conforming to this contract.
 
@@ -23,9 +23,9 @@ The `quality_assessment` block synthesizes multi-dimensional geodetic quality cr
 
 | Confidence Label | Grade | Geodetic Criteria / Thresholds | Interpretation |
 | :--- | :---: | :--- | :--- |
-| `high confidence` | **A** | • $\text{RMSE} \le 1.0\text{ px}$<br>• $N_{\text{inliers}} \ge 8$ with $\text{Ratio} \ge 20\%$ (or $N \ge 12$)<br>• $\text{SDI} \ge 0.20$<br>• $\text{Scale Disparity} \le 3.5\times$ | Sub-pixel planetary accuracy; overdetermined geometric system; reliable for scientific crater depth profiling or landing site safety mapping. |
-| `moderate confidence`| **B** | • $\text{RMSE} \le 2.0\text{ px}$<br>• $N_{\text{inliers}} \ge 4$ (satisfies 4-DOF minimal homography constraint)<br>• $\text{Ratio} \ge 10\%$ | Mathematically sound planar solution; minor local distortions, sparse inliers, or moderate scale difference. Suitable for reconnaissance. |
-| `low confidence — scale disparity may exceed matcher capability` | **C** | • $\text{Scale Disparity} > 3.5\times$ with $N_{\text{inliers}} < 10$ | Resolution gap between sensors exceeds standard scale-space octave invariance; tie points are sparse. |
+| `high confidence` | **A** | • $\text{RMSE} \le 1.0\text{ px}$<br>• $N_{\text{inliers}} \ge 8$ with $\text{Ratio} \ge 20\%$ (or $N \ge 12$)<br>• $\text{SDI} \ge 0.20$<br>• $\text{Effective Scale Disparity} \le 3.5\times$ | Sub-pixel planetary accuracy; overdetermined geometric system; reliable for scientific crater depth profiling or landing site safety mapping. |
+| `moderate confidence`| **B** | • $\text{RMSE} \le 2.0\text{ px}$<br>• $N_{\text{inliers}} \ge 4$ (satisfies 4-DOF minimal homography constraint)<br>• $\text{Ratio} \ge 10\%$<br>• $\text{Effective Scale Disparity} \le 3.5\times$ | Mathematically sound planar solution; minor local distortions, sparse inliers, or moderate scale difference. Suitable for reconnaissance. |
+| `low confidence — scale disparity may exceed matcher capability` | **C** | • $\text{Effective Scale Disparity} > 3.5\times$ with $N_{\text{inliers}} < 10$ | Resolution gap between sensors exceeds standard scale-space octave invariance; tie points are sparse. |
 | `low confidence — high reprojection residual error` | **C** | • $\text{RMSE} > 2.0\text{ px}$ | Reprojection error exceeds planetary tolerances; indicates unmodeled 3D topographic relief (e.g. crater central peak) or residual deformation. |
 | `low confidence — sparse surface inliers` | **C** | • $N_{\text{inliers}} < 4$ or $\text{Inlier Ratio} < 10\%$ | Insufficient tie points to constrain an 8-DOF planar homography. |
 | `unreliable — synthetic fallback active` | **D** | • `is_synthetic_fallback == True` | System fell back to synthetic matching coordinates; surface metrics are unverified. |
@@ -33,11 +33,11 @@ The `quality_assessment` block synthesizes multi-dimensional geodetic quality cr
 
 ---
 
-## 3. JSON Schema Specification
+## 3. JSON Schema Specification (v1.1)
 
 ```typescript
 interface ChatbotSummaryResponse {
-  schema_version: "1.0";
+  schema_version: "1.1";
   job_id: string;
   status: "PENDING" | "PREPROCESSING" | "MATCHING" | "VERIFYING" | "REFINING" | "DONE" | "FAILED";
   
@@ -59,12 +59,13 @@ interface ChatbotSummaryResponse {
   };
 
   input_metadata: {
-    img_a_path: string | null;      // Relative path to source/moving image
-    img_b_path: string | null;      // Relative path to reference image
-    gsd_a_m_per_px: number;         // Ground Sampling Distance of Image A in meters/pixel
-    gsd_b_m_per_px: number;         // Ground Sampling Distance of Image B in meters/pixel
-    scale_disparity_ratio: number;  // max(GSD_A, GSD_B) / min(GSD_A, GSD_B)
-    solar_correction_applied: boolean; // True if Lommel-Seeliger photometric normalization ran
+    img_a_path: string | null;        // Relative path to source/moving image
+    img_b_path: string | null;        // Relative path to reference image
+    gsd_a_m_per_px: number;           // Ground Sampling Distance of Image A in meters/pixel (1.0 if uncalibrated)
+    gsd_b_m_per_px: number;           // Ground Sampling Distance of Image B in meters/pixel (1.0 if uncalibrated)
+    scale_disparity_ratio: number;    // Physical GSD disparity ratio: max(GSD_A, GSD_B) / min(GSD_A, GSD_B)
+    pixel_dimension_ratio: number;    // Dimension ratio fallback: max(dim_A, dim_B) / min(dim_A, dim_B) (New in v1.1)
+    solar_correction_applied: boolean;// True if Lommel-Seeliger photometric normalization ran
   };
 
   artifacts: {
@@ -78,13 +79,53 @@ interface ChatbotSummaryResponse {
 
 ---
 
-## 4. Real-World Populated Example
+## 4. Real-World Populated Examples
 
-The following example is the actual output produced by `GET /jobs/bench_pair_2/summary` running on real ISRO lunar test imagery (`sou2.jpeg` vs `res2.jpeg`):
-
+### Example 1: Grade A (High Confidence) — Sample 7 (`sou7.jpeg` vs `res7.jpeg`)
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
+  "job_id": "bench_pair_7",
+  "status": "DONE",
+  "quality_assessment": {
+    "confidence_label": "high confidence",
+    "grade": "A",
+    "reasoning": "Sub-pixel reprojection accuracy (RMSE 0.7446 px) with strong inlier verification (12 inliers, 85.7%) and solid spatial distribution (SDI 0.2013) under a verified homography transformation.",
+    "warnings": [
+      "Solar ephemeris angles missing in metadata; Lommel-Seeliger illumination normalization was bypassed."
+    ]
+  },
+  "metrics": {
+    "rmse_px": 0.7446,
+    "inlier_ratio": 0.8571,
+    "sdi": 0.2013,
+    "transform_type": "homography",
+    "n_inliers": 12,
+    "n_total": 14,
+    "elapsed_s": 0.47
+  },
+  "input_metadata": {
+    "img_a_path": "sampledataset/sou7.jpeg",
+    "img_b_path": "sampledataset/res7.jpeg",
+    "gsd_a_m_per_px": 1.0,
+    "gsd_b_m_per_px": 1.0,
+    "scale_disparity_ratio": 1.0,
+    "pixel_dimension_ratio": 1.0,
+    "solar_correction_applied": false
+  },
+  "artifacts": {
+    "registered_geotiff": "data/jobs/bench_pair_7/output/registered.tif",
+    "checkerboard_png": "data/jobs/bench_pair_7/output/preview_checkerboard.png",
+    "tiepoints_png": "data/jobs/bench_pair_7/output/preview_tiepoints.png",
+    "residual_map_png": "data/jobs/bench_pair_7/output/residual_map.png"
+  }
+}
+```
+
+### Example 2: Grade B (Moderate Confidence) — Sample 2 (`sou2.jpeg` vs `res2.jpeg`)
+```json
+{
+  "schema_version": "1.1",
   "job_id": "bench_pair_2",
   "status": "DONE",
   "quality_assessment": {
@@ -111,6 +152,7 @@ The following example is the actual output produced by `GET /jobs/bench_pair_2/s
     "gsd_a_m_per_px": 1.0,
     "gsd_b_m_per_px": 1.0,
     "scale_disparity_ratio": 1.0,
+    "pixel_dimension_ratio": 1.11,
     "solar_correction_applied": false
   },
   "artifacts": {
@@ -122,44 +164,44 @@ The following example is the actual output produced by `GET /jobs/bench_pair_2/s
 }
 ```
 
-Another example from `bench_pair_9` (`image.png` vs `image copy.png`):
-
+### Example 3: Grade B with Scale Fallback — Sample 1 (`sou1.jpeg` vs `res1.jpeg`)
 ```json
 {
-  "schema_version": "1.0",
-  "job_id": "bench_pair_9",
+  "schema_version": "1.1",
+  "job_id": "bench_pair_1",
   "status": "DONE",
   "quality_assessment": {
     "confidence_label": "moderate confidence",
     "grade": "B",
-    "reasoning": "Registration succeeded with RMSE 0.3435 px (100.0% inliers). Confidence is moderate due to moderate spatial clustering (SDI 0.1591), but geometric solution is mathematically sound.",
+    "reasoning": "Registration succeeded with RMSE 0.0003 px (23.5% inliers). Confidence is moderate due to sparse inlier count (4 inliers), but geometric solution is mathematically sound.",
     "warnings": [
       "Solar ephemeris angles missing in metadata; Lommel-Seeliger illumination normalization was bypassed.",
-      "Low spatial dispersion index (SDI=0.1591); keypoints are clustered in a localized subregion rather than distributed across the scene."
+      "Marginal inlier count (4 verified inliers); geometric model has minimal degrees-of-freedom redundancy."
     ]
   },
   "metrics": {
-    "rmse_px": 0.3435,
-    "inlier_ratio": 1.0,
-    "sdi": 0.1591,
+    "rmse_px": 0.0003,
+    "inlier_ratio": 0.2353,
+    "sdi": 0.3333,
     "transform_type": "homography",
-    "n_inliers": 8,
-    "n_total": 8,
-    "elapsed_s": 0.93
+    "n_inliers": 4,
+    "n_total": 17,
+    "elapsed_s": 7.28
   },
   "input_metadata": {
-    "img_a_path": "sampledataset/image.png",
-    "img_b_path": "sampledataset/image copy.png",
+    "img_a_path": "sampledataset/sou1.jpeg",
+    "img_b_path": "sampledataset/res1.jpeg",
     "gsd_a_m_per_px": 1.0,
     "gsd_b_m_per_px": 1.0,
     "scale_disparity_ratio": 1.0,
+    "pixel_dimension_ratio": 1.67,
     "solar_correction_applied": false
   },
   "artifacts": {
-    "registered_geotiff": "data/jobs/bench_pair_9/output/registered.tif",
-    "checkerboard_png": "data/jobs/bench_pair_9/output/preview_checkerboard.png",
-    "tiepoints_png": "data/jobs/bench_pair_9/output/preview_tiepoints.png",
-    "residual_map_png": "data/jobs/bench_pair_9/output/residual_map.png"
+    "registered_geotiff": "data/jobs/bench_pair_1/output/registered.tif",
+    "checkerboard_png": "data/jobs/bench_pair_1/output/preview_checkerboard.png",
+    "tiepoints_png": "data/jobs/bench_pair_1/output/preview_tiepoints.png",
+    "residual_map_png": "data/jobs/bench_pair_1/output/residual_map.png"
   }
 }
 ```
@@ -172,17 +214,18 @@ Another example from `bench_pair_9` (`image.png` vs `image copy.png`):
 ```python
 import requests
 
-response = requests.get("http://localhost:8000/jobs/bench_pair_2/summary")
+response = requests.get("http://localhost:8000/jobs/bench_pair_7/summary")
 if response.status_code == 200:
     summary = response.json()
     confidence = summary["quality_assessment"]["confidence_label"]
     rmse = summary["metrics"]["rmse_px"]
     checkerboard_path = summary["artifacts"]["checkerboard_png"]
-    print(f"Status: {confidence} | Reprojection Error: {rmse} px")
+    pixel_ratio = summary["input_metadata"]["pixel_dimension_ratio"]
+    print(f"Status: {confidence} | Reprojection Error: {rmse} px | Pixel Scale Ratio: {pixel_ratio}x")
 ```
 
 ### Feeding into a Multimodal Prompt (e.g. Gemini 1.5 / GPT-4o)
 1. Pass the `summary` JSON as system context.
 2. Attach `summary["artifacts"]["checkerboard_png"]` or `tiepoints_png` as visual image inputs.
 3. Prompt the model:
-   > *"Review the registration between Lunar Frame A and Reference Frame B. The mathematical engine evaluated this as '{summary['quality_assessment']['confidence_label']}' with an RMSE of {summary['metrics']['rmse_px']} pixels. Based on the attached checkerboard mosaic, confirm whether the crater rims align seamlessly across tile boundaries."*
+   > *"Review the registration between Lunar Frame A and Reference Frame B. The mathematical engine evaluated this as '{summary['quality_assessment']['confidence_label']}' (Grade {summary['quality_assessment']['grade']}) with an RMSE of {summary['metrics']['rmse_px']} pixels and a pixel dimension ratio of {summary['input_metadata']['pixel_dimension_ratio']}x. Based on the attached checkerboard mosaic, confirm whether crater rims and topographic boundaries align seamlessly across tile seams."*

@@ -97,7 +97,7 @@ def test_summary_contract_shape(tmp_job_dir):
     td, job_id = tmp_job_dir
     summary = build_chatbot_summary(job_id, base_jobs_dir=td)
 
-    assert summary["schema_version"] == "1.0"
+    assert summary["schema_version"] == "1.1"
     assert summary["job_id"] == job_id
     assert summary["status"] == "DONE"
 
@@ -123,6 +123,8 @@ def test_summary_contract_shape(tmp_job_dir):
     assert im["gsd_a_m_per_px"] == 131.6
     assert im["gsd_b_m_per_px"] == 555.6
     assert round(im["scale_disparity_ratio"], 2) == 4.22
+    assert "pixel_dimension_ratio" in im
+    assert im["pixel_dimension_ratio"] >= 1.0
     assert im["solar_correction_applied"] is True
 
     # Artifacts block
@@ -277,6 +279,7 @@ def test_api_get_job_summary_endpoint(client):
         res_200 = client.get("/jobs/bench_pair_2/summary")
         assert res_200.status_code == 200
         data = res_200.json()
-        assert data["schema_version"] == "1.0"
+        assert data["schema_version"] == "1.1"
         assert data["job_id"] == "bench_pair_2"
         assert data["quality_assessment"]["confidence_label"] == "moderate confidence"
+        assert data["input_metadata"]["pixel_dimension_ratio"] == 1.11

@@ -61,6 +61,7 @@ class InputMetadataSchema(BaseModel):
     gsd_a_m_per_px: float = 1.0
     gsd_b_m_per_px: float = 1.0
     scale_disparity_ratio: float = 1.0
+    pixel_dimension_ratio: float = 1.0
     solar_correction_applied: bool = False
 
 
@@ -72,8 +73,8 @@ class ArtifactsSchema(BaseModel):
 
 
 class ChatbotSummaryResponse(BaseModel):
-    """Unified Chatbot/VLM/RAG payload conforming to Schema v1.0."""
-    schema_version: str = "1.0"
+    """Unified Chatbot/VLM/RAG payload conforming to Schema v1.1."""
+    schema_version: str = "1.1"
     job_id: str
     status: str
     quality_assessment: QualityAssessmentSchema

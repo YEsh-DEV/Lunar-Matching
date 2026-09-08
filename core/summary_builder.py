@@ -38,7 +38,7 @@ from core.ingest_preprocess import read_raster
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ def classify_registration_quality(
     Parameters
     ----------
     metrics : dictionary containing rmse_px, inlier_ratio, sdi, n_inliers, n_total, etc.
-    input_metadata : dictionary containing scale_disparity_ratio, solar_correction_applied, etc.
+    input_metadata : dictionary containing scale_disparity_ratio, pixel_dimension_ratio, solar_correction_applied, etc.
 
     Returns
     -------
@@ -74,8 +74,12 @@ def classify_registration_quality(
         warnings.append("Solar ephemeris angles missing in metadata; Lommel-Seeliger illumination normalization was bypassed.")
 
     scale_ratio = float(input_metadata.get("scale_disparity_ratio", 1.0))
-    if scale_ratio > 3.0:
-        warnings.append(f"High scale disparity ({scale_ratio:.2f}x) between input images.")
+    pixel_ratio = float(input_metadata.get("pixel_dimension_ratio", 1.0))
+    # Effective scale disparity accounts for both physical GSD and pixel dimension disparity
+    effective_scale = max(scale_ratio, pixel_ratio)
+
+    if effective_scale > 3.0:
+        warnings.append(f"High scale disparity ({effective_scale:.2f}x) between input images.")
 
     if status != "DONE":
         reasoning = f"Registration did not complete successfully (current state: {status})."
@@ -105,7 +109,7 @@ def classify_registration_quality(
     raw_sdi = metrics.get("sdi")
     sdi = float(raw_sdi) if raw_sdi is not None else 0.0
 
-    transform = str(metrics.get("transform", "unknown"))
+    transform = str(metrics.get("transform_type") or metrics.get("transform") or "homography")
 
     if n_inliers < 6:
         warnings.append(f"Marginal inlier count ({n_inliers} verified inliers); geometric model has minimal degrees-of-freedom redundancy.")
@@ -115,7 +119,7 @@ def classify_registration_quality(
 
     # 1. High Confidence
     # Requires sub-pixel RMSE (< 1.0 px), robust overdetermined inliers (>= 8 with >= 20% ratio or >= 12),
-    # good spatial distribution (SDI >= 0.20), and scale disparity <= 3.5x.
+    # good spatial distribution (SDI >= 0.20), and effective scale disparity <= 3.5x.
     if (
         rmse <= 1.0
         and (
@@ -124,7 +128,7 @@ def classify_registration_quality(
             or (inlier_ratio >= 0.70 and n_inliers >= 6)
         )
         and sdi >= 0.20
-        and scale_ratio <= 3.5
+        and effective_scale <= 3.5
     ):
         confidence_label = "high confidence"
         grade = "A"
@@ -136,13 +140,13 @@ def classify_registration_quality(
 
     # 2. Moderate Confidence
     # Acceptable planetary geodetic accuracy (RMSE <= 2.0 px), meets minimum 4-DOF homography constraint,
-    # and scale ratio is manageable (<= 3.5x).
-    elif rmse <= 2.0 and n_inliers >= 4 and inlier_ratio >= 0.10 and scale_ratio <= 3.5:
+    # and effective scale ratio is manageable (<= 3.5x).
+    elif rmse <= 2.0 and n_inliers >= 4 and inlier_ratio >= 0.10 and effective_scale <= 3.5:
         confidence_label = "moderate confidence"
         grade = "B"
         reasons = []
-        if scale_ratio > 2.5:
-            reasons.append(f"moderate scale disparity ({scale_ratio:.2f}x)")
+        if effective_scale > 2.5:
+            reasons.append(f"moderate scale disparity ({effective_scale:.2f}x)")
         if n_inliers < 8:
             reasons.append(f"sparse inlier count ({n_inliers} inliers)")
         if sdi < 0.25:
@@ -156,10 +160,10 @@ def classify_registration_quality(
     # 3. Low Confidence
     else:
         grade = "C"
-        if scale_ratio > 3.5 and n_inliers < 10:
+        if effective_scale > 3.5 and n_inliers < 10:
             confidence_label = "low confidence — scale disparity may exceed matcher capability"
             reasoning = (
-                f"Extreme scale difference ({scale_ratio:.2f}x) between input images exceeds standard "
+                f"Extreme scale difference ({effective_scale:.2f}x) between input images exceeds standard "
                 f"feature scale invariance limits, resulting in only {n_inliers} verified inliers."
             )
         elif rmse > 2.0:
@@ -178,9 +182,20 @@ def classify_registration_quality(
     return confidence_label, grade, reasoning, warnings
 
 
-# ---------------------------------------------------------------------------
-# Visual Artifact Generation / Verification Helpers
-# ---------------------------------------------------------------------------
+def _parse_shape(shape_val: Any) -> Optional[Tuple[int, int]]:
+    """Parse image shape from tuple, list, or string format e.g. '(975, 1600)'."""
+    if isinstance(shape_val, (tuple, list)) and len(shape_val) >= 2:
+        return int(shape_val[0]), int(shape_val[1])
+    if isinstance(shape_val, str):
+        cleaned = shape_val.strip("()[] ")
+        parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                pass
+    return None
+
 
 def _to_relative_path(path: Union[str, Path], root: Path) -> str:
     """Convert absolute path to a clean relative path string relative to root."""
@@ -437,6 +452,8 @@ def build_chatbot_summary(
     img_b_path = None
     gsd_a = 1.0
     gsd_b = 1.0
+    shape_a = None
+    shape_b = None
     solar_applied = False
 
     if paths_file.exists():
@@ -469,6 +486,9 @@ def build_chatbot_summary(
             except Exception:
                 gsd_b = 1.0
 
+            shape_a = _parse_shape(ma.get("shape"))
+            shape_b = _parse_shape(mb.get("shape"))
+
             # Check solar angles
             angles_a = [ma.get("incidence_angle"), ma.get("emission_angle"), ma.get("phase_angle")]
             angles_b = [mb.get("incidence_angle"), mb.get("emission_angle"), mb.get("phase_angle")]
@@ -478,6 +498,39 @@ def build_chatbot_summary(
         except Exception as e:
             logger.warning(f"Failed to parse metadata from {meta_file}: {e}")
 
+    # Fallback to reading shapes from disk if not found in metadata
+    if shape_a is None and img_a_path:
+        p_a = root / img_a_path if not Path(img_a_path).is_absolute() else Path(img_a_path)
+        if p_a.exists():
+            try:
+                if _HAS_RASTERIO:
+                    with rasterio.open(str(p_a)) as s:
+                        shape_a = (s.height, s.width)
+                elif _HAS_CV2:
+                    im_tmp = cv2.imread(str(p_a))
+                    if im_tmp is not None:
+                        shape_a = im_tmp.shape[:2]
+            except Exception:
+                pass
+
+    if shape_b is None and img_b_path:
+        p_b = root / img_b_path if not Path(img_b_path).is_absolute() else Path(img_b_path)
+        if p_b.exists():
+            try:
+                if _HAS_RASTERIO:
+                    with rasterio.open(str(p_b)) as s:
+                        shape_b = (s.height, s.width)
+                elif _HAS_CV2:
+                    im_tmp = cv2.imread(str(p_b))
+                    if im_tmp is not None:
+                        shape_b = im_tmp.shape[:2]
+            except Exception:
+                pass
+
+    dim_a = max(shape_a) if shape_a else 1
+    dim_b = max(shape_b) if shape_b else 1
+    pixel_dim_ratio = float(max(dim_a, dim_b) / max(min(dim_a, dim_b), 1))
+
     scale_disparity = float(max(gsd_a, gsd_b) / max(min(gsd_a, gsd_b), 1e-6))
 
     input_metadata = {
@@ -486,6 +539,7 @@ def build_chatbot_summary(
         "gsd_a_m_per_px": round(gsd_a, 4),
         "gsd_b_m_per_px": round(gsd_b, 4),
         "scale_disparity_ratio": round(scale_disparity, 2),
+        "pixel_dimension_ratio": round(pixel_dim_ratio, 2),
         "solar_correction_applied": solar_applied,
     }
 
