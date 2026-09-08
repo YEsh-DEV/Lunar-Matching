@@ -26,8 +26,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse
+from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse
 from core.ingest_preprocess import read_raster
+from core.summary_builder import build_chatbot_summary
 
 try:
     import rasterio
@@ -270,6 +271,23 @@ def get_job_result(job_id: str):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading metrics: {e}")
+
+
+@app.get("/jobs/{job_id}/summary", response_model=ChatbotSummaryResponse)
+def get_job_summary(job_id: str):
+    """
+    Unified Chatbot-Ready Output Endpoint (Schema v1.0).
+    Assembles geodetic metrics, plain-language confidence classification,
+    diagnostic reasoning, input metadata, and relative visual artifact paths.
+    """
+    try:
+        summary = build_chatbot_summary(job_id)
+        return summary
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    except Exception as e:
+        logger.error(f"Failed to build summary for {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
 
 
 @app.get("/jobs/{job_id}/preview")

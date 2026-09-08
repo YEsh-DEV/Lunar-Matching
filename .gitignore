@@ -59,8 +59,8 @@ data/samples/check/
 *.swo
 *~
 .DS_Store
-image*.png
-image copy*.png
+/image*.png
+/image copy*.png
 
 # Large model weights (if downloaded)
 *.pth
