@@ -20,6 +20,8 @@ from core.ingest_preprocess import (
     lommel_seeliger_normalize,
     build_octave_pyramid,
     align_gsd,
+    contrast_check,
+    apply_clahe_unsharp,
     _HAS_RASTERIO,
 )
 
@@ -329,3 +331,86 @@ def test_read_raster_overview_small_image_unchanged():
         if os.path.exists(p):
             os.remove(p)
 
+
+# ---------------------------------------------------------------------------
+# Stage 0.5: contrast_check and apply_clahe_unsharp tests
+# ---------------------------------------------------------------------------
+
+def test_contrast_check_high_contrast_not_flagged():
+    """
+    A high-contrast image (bright regions and dark regions well-separated)
+    must NOT be flagged as low-contrast — pre-filter should NOT fire.
+    """
+    img = np.zeros((128, 128), dtype=np.float64)
+    img[0:64, :] = 1.0   # top half bright
+    img[64:, :]  = 0.0   # bottom half dark
+    # Michelson = (1.0 - 0.0) / (1.0 + 0.0 + eps) ≈ 1.0 >> threshold 0.15
+    assert contrast_check(img, low_contrast_threshold=0.15) is False, (
+        "High-contrast image must NOT be flagged as low-contrast"
+    )
+
+
+def test_contrast_check_low_contrast_flagged():
+    """
+    A near-uniform image (small intensity spread) must be flagged as low-contrast.
+    Threshold is 0.15; Michelson on near-uniform [0.4, 0.6] is ≈ 0.2, which may
+    or may not trigger depending on exact percentiles — use a tight range.
+    """
+    # Very tight range [0.49, 0.51] → Michelson ≈ 0.02 << 0.15
+    rng = np.random.default_rng(0)
+    img = rng.uniform(0.49, 0.51, (128, 128)).astype(np.float64)
+    assert contrast_check(img, low_contrast_threshold=0.15) is True, (
+        "Near-uniform image must be flagged as low-contrast"
+    )
+
+
+def test_apply_clahe_unsharp_does_not_degrade_high_contrast():
+    """
+    High-contrast image processed through apply_clahe_unsharp must retain
+    output in [0, 1] and must NOT have LOWER Michelson contrast than input.
+    """
+    img = np.zeros((128, 128), dtype=np.float64)
+    img[0:64, :] = 1.0
+    img[64:, :]  = 0.0
+
+    enhanced = apply_clahe_unsharp(img)
+
+    assert enhanced.shape == img.shape
+    assert enhanced.dtype == np.float64
+    assert enhanced.min() >= -1e-9, "Enhanced image must be >= 0"
+    assert enhanced.max() <= 1.0 + 1e-9, "Enhanced image must be <= 1"
+
+    # Michelson contrast of enhanced must be >= original (not degraded)
+    def michelson(x):
+        hi = float(np.percentile(x, 99))
+        lo = float(np.percentile(x, 1))
+        return (hi - lo) / (hi + lo + 1e-9)
+
+    assert michelson(enhanced) >= michelson(img) - 0.05, (
+        "CLAHE+unsharp must NOT reduce contrast of an already high-contrast image"
+    )
+
+
+def test_apply_clahe_unsharp_improves_low_contrast():
+    """
+    A low-contrast image must have measurably higher Michelson contrast after
+    apply_clahe_unsharp than before — the enhancement must actually work.
+    """
+    rng = np.random.default_rng(1)
+    img = rng.uniform(0.40, 0.60, (128, 128)).astype(np.float64)
+
+    def michelson(x):
+        hi = float(np.percentile(x, 99))
+        lo = float(np.percentile(x, 1))
+        return (hi - lo) / (hi + lo + 1e-9)
+
+    before = michelson(img)
+    enhanced = apply_clahe_unsharp(img)
+    after = michelson(enhanced)
+
+    assert enhanced.shape == img.shape
+    assert enhanced.min() >= -1e-9
+    assert enhanced.max() <= 1.0 + 1e-9
+    assert after > before, (
+        f"CLAHE+unsharp must improve low-contrast image: before={before:.4f}, after={after:.4f}"
+    )

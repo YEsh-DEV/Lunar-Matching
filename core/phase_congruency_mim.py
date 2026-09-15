@@ -276,11 +276,37 @@ def mim_descriptor(
     return descriptors
 
 
-def extract_structural_features(image: np.ndarray, n_scales: int = 3, n_orientations: int = 6) -> dict:
+def extract_structural_features(image: np.ndarray, n_scales: int = 3, n_orientations: int = 6, mode: str = "standard") -> dict:
+    """
+    Extract illumination-invariant structural features using Phase Congruency and MIM.
+
+    Parameters
+    ----------
+    image         : (H, W) float64 image
+    n_scales      : number of Log-Gabor scales (default 3 — standard mode)
+    n_orientations: number of orientations. Overridden by mode parameter.
+    mode          : 'standard' (3 scales, 6 orientations — default, unchanged)
+                    'fast'     (3 scales, 4 orientations — reduced FFT count for fast path)
+                    NOTE: 'fast' mode results differ from 'standard' by design.
+
+    Returns
+    -------
+    dict with keys: pc_map, mim, edge_map, corner_map, amp_per_o
+    """
+    if mode == "fast":
+        # Fast path: 3 scales × 4 orientations = 12 FFTs per image (vs 18 in standard)
+        # Reduces FFT computation by ~33% on fast mode path ONLY.
+        # Standard mode is absolutely unchanged.
+        n_orientations_eff = 4
+    else:
+        # Standard mode: exactly as before (3 scales × 6 orientations)
+        n_orientations_eff = n_orientations  # default=6
+
     pc_per_o, amp_per_o = _phase_congruency_per_orientation(
-        image, n_scales=n_scales, n_orientations=n_orientations
+        image, n_scales=n_scales, n_orientations=n_orientations_eff
     )
-    pc_map = np.clip(pc_per_o.sum(axis=0) / n_orientations, 0, 1)
+    pc_map = np.clip(pc_per_o.sum(axis=0) / n_orientations_eff, 0, 1)
     edge_map, corner_map = moment_analysis(pc_per_o)
     mim = compute_mim(amp_per_o)
     return {'pc_map': pc_map, 'mim': mim, 'edge_map': edge_map, 'corner_map': corner_map, 'amp_per_o': amp_per_o}
+

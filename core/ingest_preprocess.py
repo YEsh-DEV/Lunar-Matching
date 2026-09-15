@@ -697,3 +697,121 @@ def align_gsd(*args, **kwargs) -> Union[Tuple[np.ndarray, np.ndarray], np.ndarra
         return source_img.copy()
 
     raise ValueError(f"align_gsd expects 3 or 4 positional arguments; received {len(args)}")
+
+
+# ---------------------------------------------------------------------------
+# Stage 0.5 — Contrast Check & CLAHE + Unsharp Pre-filter
+# ---------------------------------------------------------------------------
+
+def contrast_check(image: np.ndarray, low_contrast_threshold: float = 0.15) -> bool:
+    """
+    Determine if an image is low-contrast and needs pre-filter enhancement.
+
+    Uses Michelson contrast: (I_max - I_min) / (I_max + I_min + eps).
+    Values below low_contrast_threshold indicate blurry / degraded imagery
+    (typical for IIRS hyperspectral bands, degraded frames, or high-noise images).
+
+    Parameters
+    ----------
+    image                  : (H, W) float64 image in [0, 1] range
+    low_contrast_threshold : Michelson contrast below which pre-filter is needed
+
+    Returns
+    -------
+    bool : True if image is low-contrast (pre-filter should be applied)
+    """
+    if image is None or image.size == 0:
+        return False
+    arr = np.asarray(image, dtype=np.float64)
+    i_max = float(np.percentile(arr, 99))
+    i_min = float(np.percentile(arr, 1))
+    denom = i_max + i_min + 1e-9
+    michelson = (i_max - i_min) / denom
+    is_low = michelson < low_contrast_threshold
+    logger.debug(
+        f"Contrast check: Michelson={michelson:.4f} "
+        f"({'LOW — applying pre-filter' if is_low else 'OK — no pre-filter needed'})"
+    )
+    return is_low
+
+
+def apply_clahe_unsharp(
+    image: np.ndarray,
+    clip_limit: float = 2.5,
+    tile_grid: int = 8,
+    unsharp_strength: float = 0.6,
+    unsharp_sigma: float = 2.0,
+) -> np.ndarray:
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) followed by
+    unsharp masking to enhance low-contrast lunar imagery.
+
+    Formula: I_sharp = I_clahe + unsharp_strength * (I_clahe - Gaussian(I_clahe, sigma))
+
+    This enhances edge-like features (crater rims, lineaments) without amplifying
+    large-scale photometric gradients, making Phase Congruency more effective on
+    blurry/degraded IIRS-class data.
+
+    Parameters
+    ----------
+    image            : (H, W) float64 image (expected [0, 1] range)
+    clip_limit       : CLAHE clip limit (2.5 = moderate enhancement, not over-sharpened)
+    tile_grid        : CLAHE tile grid size (8x8 cells)
+    unsharp_strength : weight of the high-pass component (0.6 = mild sharpening)
+    unsharp_sigma    : Gaussian blur sigma for low-frequency component extraction
+
+    Returns
+    -------
+    enhanced : (H, W) float64 image in [0, 1] range
+    """
+    if image is None or image.size == 0:
+        return image
+
+    arr = np.asarray(image, dtype=np.float64)
+    H, W = arr.shape[:2]
+
+    # Normalize to uint16 for CLAHE (uint8 loses dynamic range for 16-bit PDS data)
+    arr_min, arr_max = arr.min(), arr.max()
+    if arr_max > arr_min:
+        arr_norm = ((arr - arr_min) / (arr_max - arr_min) * 65535.0).astype(np.uint16)
+    else:
+        return arr.copy()
+
+    if _HAS_CV2:
+        try:
+            clahe = cv2.createCLAHE(
+                clipLimit=clip_limit,
+                tileGridSize=(tile_grid, tile_grid),
+            )
+            enhanced_u16 = clahe.apply(arr_norm)
+            enhanced_f = enhanced_u16.astype(np.float64) / 65535.0
+
+            # Unsharp mask: high-pass = image - gaussian_blur(image)
+            blur = cv2.GaussianBlur(
+                enhanced_f.astype(np.float32),
+                (0, 0),
+                sigmaX=unsharp_sigma,
+                sigmaY=unsharp_sigma,
+            ).astype(np.float64)
+            sharpened = enhanced_f + unsharp_strength * (enhanced_f - blur)
+            sharpened = np.clip(sharpened, 0.0, 1.0)
+            return sharpened
+        except Exception as e:
+            logger.warning(f"CLAHE+unsharp failed ({e}); returning original image.")
+            return arr.copy()
+    else:
+        # Fallback: histogram equalization via numpy (no OpenCV)
+        try:
+            from scipy.ndimage import gaussian_filter
+            hist, bins = np.histogram(arr.ravel(), bins=256, range=(0.0, 1.0))
+            cdf = hist.cumsum().astype(np.float64)
+            cdf = (cdf - cdf.min()) / (cdf.max() - cdf.min() + 1e-9)
+            bin_centers = (bins[:-1] + bins[1:]) / 2.0
+            equalized = np.interp(arr.ravel(), bin_centers, cdf).reshape(arr.shape)
+            blur = gaussian_filter(equalized, sigma=unsharp_sigma)
+            sharpened = equalized + unsharp_strength * (equalized - blur)
+            return np.clip(sharpened, 0.0, 1.0)
+        except Exception as e:
+            logger.warning(f"NumPy histogram-equalization fallback failed ({e}); returning original.")
+            return arr.copy()
+

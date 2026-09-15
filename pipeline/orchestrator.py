@@ -39,7 +39,13 @@ class JobState(Enum):
     FAILED        = "FAILED"
 
 
-from core.ingest_preprocess import read_raster, lommel_seeliger_normalize, align_gsd
+from core.ingest_preprocess import (
+    read_raster,
+    lommel_seeliger_normalize,
+    align_gsd,
+    contrast_check,
+    apply_clahe_unsharp,
+)
 from core.phase_congruency_mim import extract_structural_features
 from core.dense_matcher import run_dense_matching
 from core.anms_spatial_filter import anms_select
@@ -77,11 +83,12 @@ class LunaMatchPipeline:
         result   = pipeline.run()
     """
 
-    def __init__(self, job_id: str, img_a_path: str, img_b_path: str, matching_method: str = "classical"):
+    def __init__(self, job_id: str, img_a_path: str, img_b_path: str, matching_method: str = "classical", mode: str = "standard"):
         self.job_id          = job_id
         self.img_a_path      = img_a_path
         self.img_b_path      = img_b_path
         self.matching_method = matching_method
+        self.mode            = mode
         self._state          = JobState.PENDING
         self._start_time     = time.time()
         self.stage_timings_ms = {}
@@ -168,6 +175,24 @@ class LunaMatchPipeline:
             img_b = lommel_seeliger_normalize(img_b, meta_b)
             img_a, img_b = align_gsd(img_a, img_b, meta_a, meta_b)
 
+            # ---- Stage 0.5: Conditional CLAHE + Unsharp pre-filter ----
+            # Only applied when cheap Michelson contrast check flags it.
+            # Must NOT degrade already-adequate images.
+            t_prefilter = time.perf_counter()
+            prefilter_applied_a = False
+            prefilter_applied_b = False
+            if contrast_check(img_a):
+                img_a = apply_clahe_unsharp(img_a)
+                prefilter_applied_a = True
+                logger.info(f"[{self.job_id}] Stage 0.5: Low-contrast img_a detected — CLAHE+unsharp applied")
+            if contrast_check(img_b):
+                img_b = apply_clahe_unsharp(img_b)
+                prefilter_applied_b = True
+                logger.info(f"[{self.job_id}] Stage 0.5: Low-contrast img_b detected — CLAHE+unsharp applied")
+            if not (prefilter_applied_a or prefilter_applied_b):
+                logger.info(f"[{self.job_id}] Stage 0.5: Both images have adequate contrast — pre-filter skipped")
+            self.stage_timings_ms['prefilter_ms'] = round((time.perf_counter() - t_prefilter) * 1000, 1)
+
             # Save combined metadata
             meta_dict = {
                 'img_a_path': str(self.img_a_path),
@@ -195,9 +220,9 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         t_start = time.perf_counter()
         try:
-            logger.info(f"[{self.job_id}] Step 2: Phase Congruency & MIM")
-            feats_a = extract_structural_features(img_a)
-            feats_b = extract_structural_features(img_b)
+            logger.info(f"[{self.job_id}] Step 2: Phase Congruency & MIM (mode={self.mode})")
+            feats_a = extract_structural_features(img_a, mode=self.mode)
+            feats_b = extract_structural_features(img_b, mode=self.mode)
             self._save_npy(self.paths['pc_map_a'], feats_a['pc_map'])
             self._save_npy(self.paths['mim_a'],    feats_a['mim'])
             self._save_npy(self.paths['pc_map_b'], feats_b['pc_map'])
