@@ -221,6 +221,7 @@ def _ensure_visual_artifacts(job_dir: Path, root: Path) -> Dict[str, Optional[st
         "checkerboard_png": None,
         "tiepoints_png": None,
         "residual_map_png": None,
+        "craters_png": None,
     }
 
     # 1. Registered GeoTIFF / Raster
@@ -367,6 +368,13 @@ def _ensure_visual_artifacts(job_dir: Path, root: Path) -> Dict[str, Optional[st
                     artifacts["tiepoints_png"] = _to_relative_path(tp_target, root)
             except Exception as e:
                 logger.debug(f"Could not generate tiepoints for {job_dir.name}: {e}")
+
+    # 5. Craters Overlay Map
+    craters_png = out_dir / "preview_craters.png"
+    if not craters_png.exists():
+        craters_png = out_dir / "craters_a.png"
+    if craters_png.exists():
+        artifacts["craters_png"] = _to_relative_path(craters_png, root)
 
     return artifacts
 
@@ -570,6 +578,41 @@ def build_chatbot_summary(
         "elapsed_s": metrics["elapsed_s"],
     }
 
+    # 6. Crater Detection Findings (Explanation Layer Enhancement)
+    craters_a_file = job_dir / "intermediate" / "craters_a.json"
+    craters_b_file = job_dir / "intermediate" / "craters_b.json"
+    craters_summary = None
+    if craters_a_file.exists():
+        try:
+            with open(craters_a_file, "r") as cf:
+                craters_a = json.load(cf)
+            craters_b = []
+            if craters_b_file.exists():
+                try:
+                    with open(craters_b_file, "r") as cf2:
+                        craters_b = json.load(cf2)
+                except Exception:
+                    pass
+            n_a = len(craters_a)
+            n_b = len(craters_b)
+            d_min = min((float(c.get("diameter_m", 0.0)) for c in craters_a), default=0.0)
+            d_max = max((float(c.get("diameter_m", 0.0)) for c in craters_a), default=0.0)
+
+            craters_summary = {
+                "detected_in_source": n_a,
+                "detected_in_reference": n_b,
+                "diameter_min_m": round(d_min, 1),
+                "diameter_max_m": round(d_max, 1),
+                "craters_source": craters_a,
+            }
+            if n_a > 0:
+                d_min_str = f"{d_min/1000.0:.1f}km" if d_min >= 1000 else f"{int(round(d_min))}m"
+                d_max_str = f"{d_max/1000.0:.1f}km" if d_max >= 1000 else f"{int(round(d_max))}m"
+                crater_text = f" Structural analysis detected {n_a} lunar craters in the source frame, ranging from {d_min_str} to {d_max_str} in diameter."
+                quality_assessment["reasoning"] += crater_text
+        except Exception as e_cr:
+            logger.warning(f"Could not load crater detection intermediate results: {e_cr}")
+
     summary_payload = {
         "schema_version": SCHEMA_VERSION,
         "job_id": job_id,
@@ -579,5 +622,7 @@ def build_chatbot_summary(
         "input_metadata": input_metadata,
         "artifacts": artifacts,
     }
+    if craters_summary is not None:
+        summary_payload["craters"] = craters_summary
 
     return summary_payload

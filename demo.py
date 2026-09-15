@@ -29,6 +29,12 @@ import matplotlib.pyplot as plt
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from pipeline.orchestrator import LunaMatchPipeline, JobState
 from core.ingest_preprocess import read_raster
 from core.dense_matcher import _HAS_KORNIA, select_matcher
@@ -161,11 +167,11 @@ def main():
 
     if status != 'DONE':
         print("=" * 75)
-        print(" ❌ REGISTRATION FAILED")
+        print(" [FAILED] REGISTRATION FAILED")
         print(f" Failed Stage  : {result.get('stage', 'N/A')}")
         print(f" Error Details : {result.get('error', 'Unknown failure')}")
         if is_fallback:
-            print(" ⚠️  WARNING: METRICS ARE NOT REAL — SYNTHETIC FALLBACK ACTIVE")
+            print(" [WARNING] METRICS ARE NOT REAL — SYNTHETIC FALLBACK ACTIVE")
         print("=" * 75)
 
         metrics_path = out_dir / "metrics.json"
@@ -176,7 +182,7 @@ def main():
 
     if is_fallback:
         print("\n" + "!" * 75)
-        print(" ⚠️  WARNING: METRICS ARE NOT REAL — SYNTHETIC FALLBACK ACTIVE")
+        print(" [WARNING] METRICS ARE NOT REAL — SYNTHETIC FALLBACK ACTIVE")
         print("!" * 75 + "\n")
 
     print("=" * 75)
@@ -187,8 +193,18 @@ def main():
     print(f"Inlier Verification    : {result.get('inlier_ratio', 0.0)*100:.1f}% ({result.get('n_inliers', 0)} / {result.get('n_total', 0)} verified)")
     print(f"Spatial Uniformity SDI : {result.get('sdi', 'N/A')} (Shannon Spatial Entropy)")
     print(f"Geometric Transform    : {str(result.get('transform', 'N/A')).upper()}")
-    print(f"Synthetic Fallback     : {'ACTIVE ⚠️' if is_fallback else 'NO (Genuine matches only ✅)'}")
+    print(f"Synthetic Fallback     : {'ACTIVE [WARNING]' if is_fallback else 'NO (Genuine matches only [OK])'}")
     print(f"Total Elapsed Time     : {result.get('elapsed_s', 'N/A')} seconds")
+    if 'stage_timings_ms' in result:
+        print("-" * 75)
+        print(" LATENCY BREAKDOWN BY STAGE (PERF_COUNTER):")
+        for stage, ms in result['stage_timings_ms'].items():
+            print(f"   • {stage:<28}: {ms:>7.1f} ms")
+    if 'craters_detected_a' in result or 'craters_detected_b' in result:
+        print("-" * 75)
+        print(f" LUNAR CRATER DETECTION:")
+        print(f"   • Craters detected in Frame A : {result.get('craters_detected_a', 0)}")
+        print(f"   • Craters detected in Frame B : {result.get('craters_detected_b', 0)}")
     print("=" * 75)
 
     # Save metrics JSON to output
@@ -196,12 +212,22 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    # Copy transform_params.json to output directory if present
-    job_dir = Path("data") / "jobs" / job_id
+    # Copy transform_params.json and crater overlays to output directory if present
+    job_dir = Path(__file__).resolve().parent / "data" / "jobs" / job_id
     transform_src = job_dir / "intermediate" / "transform_params.json"
     if transform_src.exists():
         import shutil
         shutil.copy(str(transform_src), str(out_dir / "transform_params.json"))
+    for crater_file in ["craters_a.json", "craters_b.json"]:
+        c_src = job_dir / "intermediate" / crater_file
+        if c_src.exists():
+            import shutil
+            shutil.copy(str(c_src), str(out_dir / crater_file))
+    for overlay_file in ["craters_a.png", "craters_b.png", "residual_map.png"]:
+        o_src = job_dir / "output" / overlay_file
+        if o_src.exists():
+            import shutil
+            shutil.copy(str(o_src), str(out_dir / overlay_file))
     matches_raw_path = job_dir / "intermediate" / "matches_raw.npy"
     matches_ver_path = job_dir / "intermediate" / "matches_verified.npy"
     registered_path = job_dir / "output" / "registered.tif"

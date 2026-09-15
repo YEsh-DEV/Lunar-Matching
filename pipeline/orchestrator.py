@@ -56,7 +56,12 @@ from core.warp_and_eval import (
     compute_inlier_ratio,
     compute_sdi,
     export_geotiff,
+    generate_residual_error_map,
 )
+from core.crater_detection import detect_craters, render_crater_overlay
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -79,9 +84,10 @@ class LunaMatchPipeline:
         self.matching_method = matching_method
         self._state          = JobState.PENDING
         self._start_time     = time.time()
+        self.stage_timings_ms = {}
 
         # Paths (interface contract)
-        base = Path("data") / "jobs" / job_id
+        base = PROJECT_ROOT / "data" / "jobs" / job_id
         self.paths = {
             'base'               : base,
             'status'             : base / "status.json",
@@ -95,8 +101,12 @@ class LunaMatchPipeline:
             'matches_anms'       : base / "intermediate" / "matches_anms.npy",
             'matches_verified'   : base / "intermediate" / "matches_verified.npy",
             'transform_params'   : base / "intermediate" / "transform_params.json",
+            'craters_a'          : base / "intermediate" / "craters_a.json",
+            'craters_b'          : base / "intermediate" / "craters_b.json",
             'registered'         : base / "output" / "registered.tif",
             'residual_map'       : base / "output" / "residual_map.png",
+            'craters_overlay_a'  : base / "output" / "craters_a.png",
+            'craters_overlay_b'  : base / "output" / "craters_b.png",
             'metrics'            : base / "output" / "metrics.json",
         }
 
@@ -139,10 +149,14 @@ class LunaMatchPipeline:
         matches_raw = matches_anms = matches_verified = None
         inlier_mask = H_matrix = tps = None
         refined_matches = None
+        craters_a = []
+        craters_b = []
+        self.stage_timings_ms = {}
 
         # ----------------------------------------------------------------
         # STEP 1 — Ingestion & Preprocessing
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             self._write_status(JobState.PREPROCESSING)
             logger.info(f"[{self.job_id}] Step 1: Ingestion & Preprocessing")
@@ -168,6 +182,8 @@ class LunaMatchPipeline:
             with open(paths_json, 'w') as f:
                 json.dump({'img_a_path': str(self.img_a_path), 'img_b_path': str(self.img_b_path)}, f, indent=2)
 
+            self.stage_timings_ms['preprocessing_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
+
         except Exception as e:
             err = f"Step 1 (Ingestion) failed: {traceback.format_exc()}"
             logger.error(err)
@@ -177,6 +193,7 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         # STEP 2 — Phase Congruency & MIM
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             logger.info(f"[{self.job_id}] Step 2: Phase Congruency & MIM")
             feats_a = extract_structural_features(img_a)
@@ -186,6 +203,8 @@ class LunaMatchPipeline:
             self._save_npy(self.paths['pc_map_b'], feats_b['pc_map'])
             self._save_npy(self.paths['mim_b'],    feats_b['mim'])
 
+            self.stage_timings_ms['phase_congruency_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
+
         except Exception as e:
             err = f"Step 2 (Phase Congruency) failed: {traceback.format_exc()}"
             logger.error(err)
@@ -193,13 +212,52 @@ class LunaMatchPipeline:
             return {'status': 'FAILED', 'stage': 'phase_congruency', 'error': str(e)}
 
         # ----------------------------------------------------------------
+        # CRATER DETECTION — Structural Rim Extraction (Purely Additive)
+        # ----------------------------------------------------------------
+        t_start = time.perf_counter()
+        try:
+            logger.info(f"[{self.job_id}] Crater Detection: Mining phase congruency edge moment maps")
+            import cv2
+            gsd_a = float(meta_a.gsd) if hasattr(meta_a, 'gsd') else float(meta_a.get('gsd', 1.0))
+            gsd_b = float(meta_b.gsd) if hasattr(meta_b, 'gsd') else float(meta_b.get('gsd', 1.0))
+
+            edge_a = feats_a.get('edge_map')
+            edge_b = feats_b.get('edge_map')
+
+            if edge_a is not None:
+                craters_a = detect_craters(edge_a, gsd_m_per_px=gsd_a)
+                with open(self.paths['craters_a'], 'w') as f:
+                    json.dump(craters_a, f, indent=2)
+                overlay_a = render_crater_overlay(img_a, craters_a)
+                cv2.imwrite(str(self.paths['craters_overlay_a']), overlay_a)
+
+            if edge_b is not None:
+                craters_b = detect_craters(edge_b, gsd_m_per_px=gsd_b)
+                with open(self.paths['craters_b'], 'w') as f:
+                    json.dump(craters_b, f, indent=2)
+                overlay_b = render_crater_overlay(img_b, craters_b)
+                cv2.imwrite(str(self.paths['craters_overlay_b']), overlay_b)
+
+            logger.info(f"  Crater detection complete: {len(craters_a)} craters in A, {len(craters_b)} craters in B")
+        except Exception as e_crater:
+            logger.warning(f"Crater detection encountered issue (non-blocking, continuing): {e_crater}")
+
+        self.stage_timings_ms['crater_detection_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
+
+        # ----------------------------------------------------------------
         # STEP 3 — Dense Matching
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             self._write_status(JobState.MATCHING)
             logger.info(f"[{self.job_id}] Step 3: Dense Matching (method={self.matching_method})")
 
-            matches_raw = run_dense_matching(img_a, img_b, method=self.matching_method)
+            matches_raw = run_dense_matching(
+                img_a, img_b,
+                method=self.matching_method,
+                feats_a=feats_a,
+                feats_b=feats_b,
+            )
 
             if matches_raw is None or len(matches_raw) < 8:
                 n_matches = 0 if matches_raw is None else len(matches_raw)
@@ -211,6 +269,7 @@ class LunaMatchPipeline:
 
             self._save_npy(self.paths['matches_raw'], matches_raw)
             logger.info(f"  {len(matches_raw)} raw candidates")
+            self.stage_timings_ms['dense_matching_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
         except Exception as e:
             err = f"Step 3 (Dense Matching) failed: {e}"
@@ -229,6 +288,7 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         # STEP 4 — ANMS Spatial Filtering
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             logger.info(f"[{self.job_id}] Step 4: ANMS Spatial Filtering")
 
@@ -243,6 +303,7 @@ class LunaMatchPipeline:
 
             self._save_npy(self.paths['matches_anms'], matches_anms)
             logger.info(f"  {len(matches_anms)} candidates after ANMS")
+            self.stage_timings_ms['anms_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
         except Exception as e:
             err = f"Step 4 (ANMS) failed: {traceback.format_exc()}"
@@ -253,6 +314,7 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         # STEP 5 — MAGSAC++ + TPS Geometric Verification
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             self._write_status(JobState.VERIFYING)
             logger.info(f"[{self.job_id}] Step 5: MAGSAC++ & Geometric Verification")
@@ -307,6 +369,7 @@ class LunaMatchPipeline:
                 f"  {inlier_mask.sum()} inliers ({100*inlier_mask.mean():.1f}%) | "
                 f"transform={transform_type}"
             )
+            self.stage_timings_ms['verification_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
         except Exception as e:
             err = f"Step 5 (Geometric Verification) failed: {e}"
@@ -325,12 +388,40 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         # STEP 6 — Sub-Pixel Refinement
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             self._write_status(JobState.REFINING)
             logger.info(f"[{self.job_id}] Step 6: Lucas-Kanade Sub-Pixel Refinement")
 
-            refined_matches = refine_all_matches(img_a, img_b, inlier_matches)
+            pc_a = feats_a['pc_map'] if (feats_a and 'pc_map' in feats_a) else img_a
+            pc_b = feats_b['pc_map'] if (feats_b and 'pc_map' in feats_b) else img_b
+            refined_matches = refine_all_matches(pc_a, pc_b, inlier_matches)
+
+            # Re-fit the transform with refined coordinates so Step 7 warping uses sub-pixel accuracy
+            pts_a_ref = refined_matches[:, :2]
+            pts_b_ref = refined_matches[:, 2:4]
+            if transform_type == 'tps':
+                try:
+                    transform = fit_thin_plate_spline(pts_a_ref, pts_b_ref)
+                except Exception as e_tps:
+                    logger.warning(f"Could not refit TPS on refined matches: {e_tps}; using initial TPS")
+            elif transform_type == 'homography' and len(refined_matches) >= 4:
+                try:
+                    import cv2
+                    H_ref, _ = cv2.findHomography(
+                        pts_a_ref.reshape(-1, 1, 2),
+                        pts_b_ref.reshape(-1, 1, 2),
+                        0,
+                    )
+                    if H_ref is not None:
+                        transform = H_ref.astype(np.float64)
+                        if H_matrix is not None:
+                            H_matrix = transform
+                except Exception as e_href:
+                    logger.warning(f"Could not refit homography on refined matches: {e_href}")
+
             logger.info(f"  Sub-pixel refinement complete on {len(refined_matches)} points")
+            self.stage_timings_ms['refinement_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
         except Exception as e:
             err = f"Step 6 (Sub-Pixel Refinement) failed: {e}"
@@ -349,6 +440,7 @@ class LunaMatchPipeline:
         # ----------------------------------------------------------------
         # STEP 7 — Warp & Evaluation
         # ----------------------------------------------------------------
+        t_start = time.perf_counter()
         try:
             logger.info(f"[{self.job_id}] Step 7: Image Warping & Evaluation")
 
@@ -358,8 +450,33 @@ class LunaMatchPipeline:
             inlier_ratio = compute_inlier_ratio(inlier_mask)
             sdi          = compute_sdi(refined_matches, img_a.shape)
 
-            export_geotiff(registered, self.paths['registered'], meta_b)
+            export_geotiff(registered, self.paths['registered'], meta_a)
 
+            # Generate 2D residual error heatmap figure
+            try:
+                import cv2
+                pts_a_ref = refined_matches[:, :2].astype(np.float64)
+                pts_b_ref = refined_matches[:, 2:4].astype(np.float64)
+                if hasattr(transform, 'apply'):
+                    pts_b_proj = transform.apply(pts_a_ref)
+                elif isinstance(transform, np.ndarray) and transform.shape == (3, 3):
+                    ones = np.ones((len(pts_a_ref), 1), dtype=np.float64)
+                    proj = (transform @ np.hstack([pts_a_ref, ones]).T).T
+                    pts_b_proj = proj[:, :2] / (proj[:, 2:3] + 1e-10)
+                else:
+                    pts_b_proj = pts_a_ref
+
+                res_map = generate_residual_error_map(pts_b_proj, pts_b_ref, img_a.shape)
+                res_max = np.nanpercentile(res_map, 95) if np.nanpercentile(res_map, 95) > 0 else 1.0
+                res_norm = np.clip(res_map / res_max, 0, 1)
+                res_u8 = (res_norm * 255).astype(np.uint8)
+                res_color = cv2.applyColorMap(res_u8, cv2.COLORMAP_JET)
+                cv2.imwrite(str(self.paths['residual_map']), res_color)
+            except Exception as e_res:
+                logger.warning(f"Residual error map figure generation skipped: {e_res}")
+
+            self.stage_timings_ms['warp_and_eval_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
+            self.stage_timings_ms['total_pipeline_ms'] = round((time.time() - self._start_time) * 1000, 1)
 
             metrics = {
                 'status'               : 'DONE',
@@ -371,6 +488,9 @@ class LunaMatchPipeline:
                 'elapsed_s'            : round(time.time() - self._start_time, 2),
                 'transform'            : transform_type,
                 'is_synthetic_fallback': False,
+                'stage_timings_ms'     : self.stage_timings_ms,
+                'craters_detected_a'   : len(craters_a),
+                'craters_detected_b'   : len(craters_b),
             }
 
             with open(self.paths['metrics'], 'w') as f:
@@ -380,7 +500,8 @@ class LunaMatchPipeline:
 
             logger.info(
                 f"[{self.job_id}] DONE | RMSE={rmse:.3f}px | "
-                f"Inlier Ratio={inlier_ratio:.1%} | SDI={sdi:.3f}"
+                f"Inlier Ratio={inlier_ratio:.1%} | SDI={sdi:.3f} | "
+                f"Total Time={metrics['elapsed_s']}s"
             )
             return {'status': 'DONE', **metrics}
 

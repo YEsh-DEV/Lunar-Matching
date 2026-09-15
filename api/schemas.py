@@ -70,10 +70,11 @@ class ArtifactsSchema(BaseModel):
     checkerboard_png: Optional[str] = None
     tiepoints_png: Optional[str] = None
     residual_map_png: Optional[str] = None
+    craters_png: Optional[str] = None
 
 
-class ChatbotSummaryResponse(BaseModel):
-    """Unified Chatbot/VLM/RAG payload conforming to Schema v1.1."""
+class SummaryResponse(BaseModel):
+    """Deterministic Quality Assessment & Explanation Summary conforming to Schema v1.1."""
     schema_version: str = "1.1"
     job_id: str
     status: str
@@ -81,4 +82,10 @@ class ChatbotSummaryResponse(BaseModel):
     metrics: MetricsSchema
     input_metadata: InputMetadataSchema
     artifacts: ArtifactsSchema
+    craters: Optional[Dict[str, Any]] = None
+
+
+# Backward compatibility alias
+ChatbotSummaryResponse = SummaryResponse
+
 

@@ -2,7 +2,19 @@
 core/phase_congruency_mim.py  (v2 - DC fix, correct ifftshift convention)
 """
 import numpy as np
-from numpy.fft import fft2, ifft2, ifftshift, fftshift
+
+try:
+    from scipy.fft import fft2 as _sp_fft2, ifft2 as _sp_ifft2
+    def fft2(x):
+        return _sp_fft2(x, workers=-1)
+    def ifft2(x):
+        return _sp_ifft2(x, workers=-1)
+except ImportError:
+    from numpy.fft import fft2, ifft2
+
+from numpy.fft import ifftshift, fftshift
+
+_FILTER_BANK_CACHE = {}
 
 
 def log_gabor_filter_bank(
@@ -14,6 +26,10 @@ def log_gabor_filter_bank(
     sigma_on_f: float = 0.55,
     d_theta_on_sigma: float = 1.5,
 ) -> list:
+    cache_key = (shape, n_scales, n_orientations, min_wavelength, mult, sigma_on_f, d_theta_on_sigma)
+    if cache_key in _FILTER_BANK_CACHE:
+        return _FILTER_BANK_CACHE[cache_key]
+
     rows, cols = shape
     # Build frequency coordinates with DC at centre (use fftshift of fftfreq grid)
     u = np.fft.fftfreq(cols)   # DC at index 0
@@ -58,7 +74,9 @@ def log_gabor_filter_bank(
             scale_filters.append(filt)
         filter_bank.append(scale_filters)
 
+    _FILTER_BANK_CACHE[cache_key] = filter_bank
     return filter_bank
+
 
 
 def compute_even_odd_responses(image: np.ndarray, filter_bank: list) -> tuple:
@@ -220,9 +238,14 @@ def mim_descriptor(
     N   = len(keypoints)
     dim = grid_size * grid_size * num_orientation_bins
     descriptors = np.zeros((N, dim), dtype=np.float32)
+    if N == 0:
+        return descriptors
+
     H, W = mim.shape
     p    = patch_radius
     pw   = 2 * p
+    mim_padded = np.pad(mim, p, mode='reflect')
+
     gy, gx = np.meshgrid(np.arange(pw), np.arange(pw), indexing='ij')
     gauss  = np.exp(-((gx - p) ** 2 + (gy - p) ** 2) / (2.0 * p ** 2))
     cell_h = pw // grid_size
@@ -230,9 +253,16 @@ def mim_descriptor(
 
     for n, (kx, ky) in enumerate(keypoints):
         kx, ky = int(round(kx)), int(round(ky))
-        if kx < p or kx >= W - p or ky < p or ky >= H - p:
+        py_start = max(0, ky)
+        py_end   = py_start + pw
+        px_start = max(0, kx)
+        px_end   = px_start + pw
+
+        patch = mim_padded[py_start:py_end, px_start:px_end].astype(np.float32)
+        if patch.shape != (pw, pw):
             continue
-        patch = mim[ky - p : ky + p, kx - p : kx + p].astype(np.float32) * gauss
+        patch = patch * gauss
+
         desc_idx = 0
         for ci in range(grid_size):
             for cj in range(grid_size):

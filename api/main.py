@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse
+from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, SummaryResponse, ChatbotSummaryResponse
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
 
@@ -273,10 +273,10 @@ def get_job_result(job_id: str):
         raise HTTPException(status_code=500, detail=f"Error reading metrics: {e}")
 
 
-@app.get("/jobs/{job_id}/summary", response_model=ChatbotSummaryResponse)
+@app.get("/jobs/{job_id}/summary", response_model=SummaryResponse)
 def get_job_summary(job_id: str):
     """
-    Unified Chatbot-Ready Output Endpoint (Schema v1.0).
+    Deterministic Quality Assessment & Explanation Summary Endpoint.
     Assembles geodetic metrics, plain-language confidence classification,
     diagnostic reasoning, input metadata, and relative visual artifact paths.
     """
@@ -380,6 +380,30 @@ def get_job_preview(job_id: str, kind: str = "registered"):
         tp_canvas = draw_tie_points(raw_a, raw_b, matches)
         cv2.imwrite(str(tp_cache_path), tp_canvas)
         return FileResponse(str(tp_cache_path), media_type="image/png")
+
+    elif kind == "craters":
+        crater_cache_path = job_dir / "output" / "preview_craters.png"
+        if crater_cache_path.exists():
+            return FileResponse(str(crater_cache_path), media_type="image/png")
+        crater_a_path = job_dir / "output" / "craters_a.png"
+        if crater_a_path.exists():
+            return FileResponse(str(crater_a_path), media_type="image/png")
+
+        craters_json = job_dir / "intermediate" / "craters_a.json"
+        path_a, _ = _find_job_inputs(job_dir)
+        if craters_json.exists() and path_a and os.path.exists(path_a):
+            try:
+                from core.crater_detection import render_crater_overlay
+                with open(craters_json, "r") as cf:
+                    craters = json.load(cf)
+                raw_a, _ = read_raster(path_a)
+                canvas = render_crater_overlay(raw_a, craters)
+                cv2.imwrite(str(crater_cache_path), canvas)
+                return FileResponse(str(crater_cache_path), media_type="image/png")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to generate crater preview: {e}")
+
+        raise HTTPException(status_code=404, detail="Crater overlay preview not found or not yet generated.")
 
     # Default: registered output
     tif_path = job_dir / "output" / "registered.tif"
