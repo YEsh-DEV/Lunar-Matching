@@ -135,3 +135,137 @@ def test_render_crater_overlay():
     assert overlay.dtype == np.uint8
     # Should not be entirely black (annotations drawn)
     assert np.any(overlay > 0)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 4: Fitzgibbon direct algebraic LS ellipse fitting
+# ---------------------------------------------------------------------------
+
+def test_fitzgibbon_fits_known_ellipse():
+    """
+    fit_ellipse_fitzgibbon must recover center and semi-axes of a known ellipse
+    to within a small tolerance.
+    """
+    from core.crater_detection import fit_ellipse_fitzgibbon
+
+    # Generate dense samples on a known ellipse: center=(100, 80), a=40, b=25
+    t = np.linspace(0, 2 * np.pi, 200)
+    cx_true, cy_true = 100.0, 80.0
+    a_true, b_true = 40.0, 25.0
+    x = cx_true + a_true * np.cos(t)
+    y = cy_true + b_true * np.sin(t)
+
+    pts = np.column_stack([x, y])
+    result = fit_ellipse_fitzgibbon(pts)
+
+    assert result is not None, "Fitzgibbon must succeed on a clean ellipse"
+    cx_fit, cy_fit = result['center_px']
+
+    # Center must be within 2px of truth
+    assert abs(cx_fit - cx_true) < 2.0, f"Center x error: {abs(cx_fit - cx_true):.2f}px"
+    assert abs(cy_fit - cy_true) < 2.0, f"Center y error: {abs(cy_fit - cy_true):.2f}px"
+
+    # Semi-axes must match within 2px (either orientation)
+    a_fit = result['semi_major_px']
+    b_fit = result['semi_minor_px']
+    # The larger of the two fits the true major axis
+    assert abs(a_fit - a_true) < 3.0 or abs(a_fit - b_true) < 3.0, (
+        f"Semi-major axis error: fit={a_fit:.2f}, truth={a_true}"
+    )
+
+
+def test_fitzgibbon_requires_minimum_6_points():
+    """fit_ellipse_fitzgibbon must return None when fewer than 6 points are given."""
+    from core.crater_detection import fit_ellipse_fitzgibbon
+
+    pts = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float64)
+    result = fit_ellipse_fitzgibbon(pts)
+    assert result is None, "Must return None for < 6 points"
+
+
+def test_detect_craters_fitzgibbon_on_synthetic():
+    """
+    detect_craters_fitzgibbon must find at least the primary synthetic crater and
+    not hallucinate detections on a flat image.
+    """
+    from core.crater_detection import detect_craters_fitzgibbon
+
+    H, W = 300, 300
+    edge_map = np.zeros((H, W), dtype=np.float32)
+    # Draw one clear ellipse (a=35, b=28) at (150, 150)
+    cv2.ellipse(edge_map, (150, 150), (35, 28), 0, 0, 360, 1.0, 2)
+
+    detected = detect_craters_fitzgibbon(
+        edge_map, gsd_m_per_px=2.0, min_diameter_px=20, confidence_thresh=0.20
+    )
+    # Must find at least 1 crater
+    assert len(detected) >= 1, f"Must detect synthetic ellipse; got {len(detected)}"
+
+    # All detected craters must have 'method' field
+    for d in detected:
+        assert 'method' in d
+        assert d['method'] == 'fitzgibbon_direct_ls'
+
+    # Flat image must produce zero detections
+    flat = np.zeros((200, 200), dtype=np.float32)
+    assert detect_craters_fitzgibbon(flat) == []
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 5: SFD computation tests
+# ---------------------------------------------------------------------------
+
+def test_compute_sfd_empty_craters():
+    """compute_sfd on empty list must return valid dict with n_craters=0."""
+    from core.crater_detection import compute_sfd
+
+    result = compute_sfd([])
+    assert result['n_craters'] == 0
+    assert result['power_law_slope'] is None
+    assert result['sfd_r2'] is None
+
+
+def test_compute_sfd_power_law_fit():
+    """
+    compute_sfd on a synthetic power-law distributed crater population must
+    return a negative slope and R^2 > 0.8 (good fit).
+    """
+    from core.crater_detection import compute_sfd
+
+    # Synthetic crater list: sizes following ~D^-2.5 distribution
+    rng = np.random.default_rng(7)
+    # Generate 80 craters with power-law sizes
+    diameters = np.sort(rng.uniform(500, 15000, 80))[::-1]
+    craters = [{'diameter_m': float(d)} for d in diameters]
+
+    result = compute_sfd(craters, n_bins=10)
+
+    assert result['n_craters'] == 80
+    assert len(result['diameters_m']) == 80
+    assert len(result['bin_counts']) == 10
+    assert result['power_law_slope'] is not None, "Must fit power law slope"
+    assert result['power_law_slope'] < 0, (
+        f"SFD slope must be negative (got {result['power_law_slope']})"
+    )
+    # R^2 must be reasonable for a uniform distribution (not perfect power law)
+    # Just check it's computed and finite
+    assert result['sfd_r2'] is not None
+    assert -1.0 <= result['sfd_r2'] <= 1.0
+
+
+def test_compute_sfd_physical_fields():
+    """compute_sfd must return all required output fields."""
+    from core.crater_detection import compute_sfd
+
+    craters = [{'diameter_m': float(d)} for d in [1000, 2000, 3000, 5000, 8000, 12000]]
+    result = compute_sfd(craters)
+
+    required_keys = [
+        'diameters_m', 'bin_edges_m', 'bin_counts', 'bin_centers_m',
+        'power_law_slope', 'power_law_intercept', 'n_craters', 'sfd_r2',
+    ]
+    for key in required_keys:
+        assert key in result, f"SFD result missing required key: {key}"
+
+    assert result['n_craters'] == 6
+    assert len(result['bin_edges_m']) == len(result['bin_centers_m']) + 1

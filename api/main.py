@@ -415,3 +415,323 @@ def get_job_preview(job_id: str, kind: str = "registered"):
         return FileResponse(str(npy_path), media_type="application/octet-stream")
 
     raise HTTPException(status_code=404, detail=f"Preview kind '{kind}' not found or output missing.")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 5: /jobs/{job_id}/graphs endpoint
+# ---------------------------------------------------------------------------
+
+VALID_GRAPH_KINDS = ["sfd", "residual_scatter", "residual_histogram", "crater_histogram", "confidence_gauge"]
+
+
+@app.get("/jobs/{job_id}/graphs")
+def get_job_graphs(job_id: str, kind: str = "sfd"):
+    """
+    Serve rendered chart PNG artifacts for scientific visualization.
+
+    Supported kinds:
+      - kind='sfd'                : Crater Size-Frequency Distribution (log-log power law plot)
+      - kind='residual_scatter'   : Residual error scatter plot (reprojected vs reference)
+      - kind='residual_histogram' : Histogram of per-point residual errors
+      - kind='crater_histogram'   : Crater diameter histogram (bar chart by size class)
+      - kind='confidence_gauge'   : Registration confidence quality gauge
+
+    All graphs are cached as PNG to output/ on first render and served from disk thereafter.
+    """
+    if kind not in VALID_GRAPH_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_KIND",
+                "message": f"Unknown graph kind: '{kind}'",
+                "valid_values": VALID_GRAPH_KINDS,
+            }
+        )
+
+    job_dir = Path("data") / "jobs" / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    output_dir = job_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- SFD (Crater Size-Frequency Distribution) ----
+    if kind == "sfd":
+        sfd_cache = output_dir / "graph_sfd.png"
+        if sfd_cache.exists():
+            return FileResponse(str(sfd_cache), media_type="image/png")
+
+        # Load crater data
+        craters_a_path = job_dir / "intermediate" / "craters_a.json"
+        craters_b_path = job_dir / "intermediate" / "craters_b.json"
+
+        craters = []
+        for p in [craters_a_path, craters_b_path]:
+            if p.exists():
+                try:
+                    with open(p, "r") as f:
+                        craters.extend(json.load(f))
+                except Exception:
+                    pass
+
+        from core.crater_detection import compute_sfd
+        sfd = compute_sfd(craters, n_bins=12)
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(8, 5))
+            fig.patch.set_facecolor("#1a1a2e")
+            ax.set_facecolor("#16213e")
+
+            bin_centers = sfd.get("bin_centers_m", [])
+            bin_counts = sfd.get("bin_counts", [])
+            slope = sfd.get("power_law_slope")
+            intercept = sfd.get("power_law_intercept")
+            r2 = sfd.get("sfd_r2")
+            n_craters = sfd.get("n_craters", 0)
+
+            if bin_centers and bin_counts and any(c > 0 for c in bin_counts):
+                valid_mask = [c > 0 for c in bin_counts]
+                bc_valid = [bin_centers[i] for i, v in enumerate(valid_mask) if v]
+                bn_valid = [bin_counts[i] for i, v in enumerate(valid_mask) if v]
+
+                ax.loglog(
+                    bc_valid, bn_valid,
+                    'o-', color='#00d4ff', linewidth=2, markersize=6,
+                    label=f"N(>D) — {n_craters} craters"
+                )
+
+                # Power law fit overlay
+                if slope is not None and intercept is not None and len(bc_valid) >= 3:
+                    import numpy as _np
+                    d_range = _np.logspace(
+                        _np.log10(min(bc_valid)), _np.log10(max(bc_valid)), 50
+                    )
+                    n_fit = 10 ** (slope * _np.log10(d_range) + intercept)
+                    ax.loglog(
+                        d_range, n_fit, '--', color='#ff6b6b', linewidth=1.8,
+                        label=f"Power law: N ∝ D^{slope:.2f} (R²={r2:.2f})"
+                    )
+
+                ax.set_xlabel("Crater Diameter D (m)", color='white', fontsize=11)
+                ax.set_ylabel("Cumulative Count N(>D)", color='white', fontsize=11)
+                ax.set_title(
+                    f"Crater Size-Frequency Distribution (SFD) — Job {job_id[:12]}",
+                    color='white', fontsize=12, fontweight='bold'
+                )
+                ax.tick_params(colors='white')
+                ax.spines['bottom'].set_color('gray')
+                ax.spines['left'].set_color('gray')
+                ax.legend(loc='upper right', facecolor='#1a1a2e', labelcolor='white', fontsize=9)
+                ax.grid(True, which='both', linestyle='--', alpha=0.3, color='gray')
+
+                # Physical age annotation
+                if slope is not None:
+                    age_str = ("Older terrain (b≥2.5)" if slope <= -2.5
+                               else "Younger terrain (b<2.0)" if slope > -2.0
+                               else "Moderate age terrain")
+                    ax.text(
+                        0.02, 0.05, age_str,
+                        transform=ax.transAxes, color='#ffdd57', fontsize=9, style='italic'
+                    )
+            else:
+                ax.text(
+                    0.5, 0.5, f"No crater data available\n(n_craters={n_craters})",
+                    transform=ax.transAxes, ha='center', va='center',
+                    color='gray', fontsize=12
+                )
+                ax.set_xlabel("Crater Diameter (m)", color='white')
+                ax.set_ylabel("Cumulative Count", color='white')
+
+            plt.tight_layout(pad=1.2)
+            plt.savefig(str(sfd_cache), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+            return FileResponse(str(sfd_cache), media_type="image/png")
+
+        except ImportError:
+            # matplotlib not available — return SFD data as JSON fallback
+            return JSONResponse(content=sfd)
+        except Exception as e:
+            logger.error(f"SFD graph render failed for {job_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"SFD graph generation failed: {e}")
+
+    # ---- Residual Scatter ----
+    elif kind == "residual_scatter":
+        cache = output_dir / "graph_residual_scatter.png"
+        if cache.exists():
+            return FileResponse(str(cache), media_type="image/png")
+
+        matches_path = job_dir / "intermediate" / "matches_refined.npy"
+        if not matches_path.exists():
+            matches_path = job_dir / "intermediate" / "matches_verified.npy"
+        if not matches_path.exists():
+            raise HTTPException(status_code=404, detail="Match data not found for residual scatter.")
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as _np
+
+            matches = _np.load(str(matches_path))
+            pts_a = matches[:, :2]
+            pts_b = matches[:, 2:4]
+            residuals = _np.linalg.norm(pts_a - pts_b, axis=1)
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            fig.patch.set_facecolor("#1a1a2e")
+            ax.set_facecolor("#16213e")
+            sc = ax.scatter(pts_a[:, 0], pts_a[:, 1], c=residuals, cmap='plasma',
+                            s=20, alpha=0.8, vmin=0, vmax=_np.percentile(residuals, 95))
+            plt.colorbar(sc, ax=ax, label="Residual (px)").ax.yaxis.label.set_color('white')
+            ax.set_xlabel("x (px)", color='white')
+            ax.set_ylabel("y (px)", color='white')
+            ax.set_title(f"Reprojection Residual Scatter — Job {job_id[:12]}",
+                         color='white', fontweight='bold')
+            ax.tick_params(colors='white')
+            plt.tight_layout()
+            plt.savefig(str(cache), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+            return FileResponse(str(cache), media_type="image/png")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Residual scatter generation failed: {e}")
+
+    # ---- Residual Histogram ----
+    elif kind == "residual_histogram":
+        cache = output_dir / "graph_residual_histogram.png"
+        if cache.exists():
+            return FileResponse(str(cache), media_type="image/png")
+
+        matches_path = job_dir / "intermediate" / "matches_refined.npy"
+        if not matches_path.exists():
+            matches_path = job_dir / "intermediate" / "matches_verified.npy"
+        if not matches_path.exists():
+            raise HTTPException(status_code=404, detail="Match data not found for histogram.")
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as _np
+
+            matches = _np.load(str(matches_path))
+            residuals = _np.linalg.norm(matches[:, :2] - matches[:, 2:4], axis=1)
+            rmse = float(_np.sqrt(_np.mean(residuals**2)))
+
+            fig, ax = plt.subplots(figsize=(7, 4))
+            fig.patch.set_facecolor("#1a1a2e")
+            ax.set_facecolor("#16213e")
+            ax.hist(residuals, bins=30, color='#00d4ff', edgecolor='#1a1a2e', alpha=0.85)
+            ax.axvline(rmse, color='#ff6b6b', linestyle='--', linewidth=2,
+                       label=f"RMSE = {rmse:.3f}px")
+            ax.set_xlabel("Residual Error (px)", color='white')
+            ax.set_ylabel("Count", color='white')
+            ax.set_title(f"Residual Error Distribution — {len(matches)} inliers",
+                         color='white', fontweight='bold')
+            ax.tick_params(colors='white')
+            ax.legend(facecolor='#1a1a2e', labelcolor='white')
+            plt.tight_layout()
+            plt.savefig(str(cache), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+            return FileResponse(str(cache), media_type="image/png")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Residual histogram failed: {e}")
+
+    # ---- Crater Histogram ----
+    elif kind == "crater_histogram":
+        cache = output_dir / "graph_crater_histogram.png"
+        if cache.exists():
+            return FileResponse(str(cache), media_type="image/png")
+
+        craters_path = job_dir / "intermediate" / "craters_a.json"
+        if not craters_path.exists():
+            raise HTTPException(status_code=404, detail="Crater data not found.")
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from core.crater_detection import bucket_diameter_histogram
+
+            with open(craters_path, "r") as f:
+                craters = json.load(f)
+
+            buckets = bucket_diameter_histogram(craters)
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            fig.patch.set_facecolor("#1a1a2e")
+            ax.set_facecolor("#16213e")
+            colors = ['#00d4ff', '#4cc9f0', '#7209b7', '#f72585']
+            bars = ax.bar(list(buckets.keys()), list(buckets.values()),
+                          color=colors, edgecolor='#1a1a2e')
+            ax.set_xlabel("Diameter Class", color='white')
+            ax.set_ylabel("Count", color='white')
+            ax.set_title(f"Crater Diameter Histogram — {len(craters)} craters",
+                         color='white', fontweight='bold')
+            ax.tick_params(colors='white')
+            for bar, val in zip(bars, buckets.values()):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                        str(val), ha='center', va='bottom', color='white', fontsize=9)
+            plt.tight_layout()
+            plt.savefig(str(cache), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+            return FileResponse(str(cache), media_type="image/png")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Crater histogram failed: {e}")
+
+    # ---- Confidence Gauge ----
+    elif kind == "confidence_gauge":
+        cache = output_dir / "graph_confidence_gauge.png"
+        if cache.exists():
+            return FileResponse(str(cache), media_type="image/png")
+
+        metrics_path = job_dir / "output" / "metrics.json"
+        if not metrics_path.exists():
+            raise HTTPException(status_code=404, detail="Metrics not found for confidence gauge.")
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as _np
+
+            with open(metrics_path, "r") as f:
+                metrics = json.load(f)
+
+            rmse = metrics.get("rmse_px", 999)
+            sdi = metrics.get("sdi", 0)
+            inlier_ratio = metrics.get("inlier_ratio", 0)
+            # Compute 0-100 confidence score
+            score = min(100, max(0,
+                100 - min(rmse, 5) * 15 + sdi * 20 + inlier_ratio * 20
+            ))
+
+            fig, ax = plt.subplots(figsize=(5, 5), subplot_kw={'projection': 'polar'})
+            fig.patch.set_facecolor("#1a1a2e")
+            ax.set_facecolor("#16213e")
+            theta = _np.linspace(0, _np.pi, 200)
+            ax.plot(theta, [1]*200, color='#2d2d4e', linewidth=30)
+            fill_theta = _np.linspace(0, _np.pi * score / 100, 200)
+            color = '#ff6b6b' if score < 40 else '#ffdd57' if score < 70 else '#51cf66'
+            ax.plot(fill_theta, [1]*len(fill_theta), color=color, linewidth=30)
+            ax.set_ylim(0, 1.5)
+            ax.set_theta_zero_location('W')
+            ax.set_theta_direction(-1)
+            ax.axis('off')
+            ax.text(0, 0.25, f"{score:.0f}",
+                    ha='center', va='center', fontsize=36, color='white', fontweight='bold',
+                    transform=ax.transData)
+            ax.set_title(f"Registration Confidence\nRMSE={rmse:.3f}px | SDI={sdi:.2f}",
+                         color='white', fontsize=10, pad=20)
+            plt.tight_layout()
+            plt.savefig(str(cache), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.close(fig)
+            return FileResponse(str(cache), media_type="image/png")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Confidence gauge failed: {e}")
+
+    raise HTTPException(status_code=400, detail=f"Unhandled graph kind: {kind}")
+
