@@ -55,6 +55,7 @@ data/samples/check/
 # Editor / IDE
 .vscode/
 .idea/
+pyrightconfig.json
 *.swp
 *.swo
 *~

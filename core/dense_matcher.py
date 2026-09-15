@@ -203,7 +203,9 @@ def run_structural_matching(
     img_b: np.ndarray,
     confidence_thresh: float = 0.5,
     max_features: int = 4000,
-    ratio_thresh: float = 0.95,
+    ratio_thresh: float = 0.85,
+    feats_a: Optional[dict] = None,
+    feats_b: Optional[dict] = None,
 ) -> np.ndarray:
     """
     RIFT-style structural matching using Phase Congruency & Maximum Index Map (MIM).
@@ -216,7 +218,8 @@ def run_structural_matching(
     img_b             : (H, W) ndarray
     confidence_thresh : minimum match confidence threshold [0.0, 1.0]
     max_features      : maximum keypoints to detect per image
-    ratio_thresh      : Lowe's ratio test threshold (default: 0.95)
+    ratio_thresh      : Lowe's ratio test threshold (default: 0.85)
+    feats_a, feats_b  : optional precomputed structural features dict from extract_structural_features
 
     Returns
     -------
@@ -235,10 +238,12 @@ def run_structural_matching(
     u8_a = to_u8(img_a)
     u8_b = to_u8(img_b)
 
-    # 1. Compute Phase Congruency and Maximum Index Map (MIM)
+    # 1. Compute Phase Congruency and Maximum Index Map (MIM) if not provided
     try:
-        feats_a = extract_structural_features(img_a)
-        feats_b = extract_structural_features(img_b)
+        if feats_a is None:
+            feats_a = extract_structural_features(img_a)
+        if feats_b is None:
+            feats_b = extract_structural_features(img_b)
         mim_a = feats_a['mim']
         mim_b = feats_b['mim']
     except Exception as e:
@@ -317,6 +322,8 @@ def run_dense_matching(
     model: Optional[object] = None,
     confidence_thresh: float = 0.5,
     method: str = 'classical',
+    feats_a: Optional[dict] = None,
+    feats_b: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Execute dense/semi-dense image correspondence.
@@ -324,6 +331,7 @@ def run_dense_matching(
     Dispatches to:
       - 'structural': RIFT-style Phase Congruency / MIM structural matching
       - 'classical' : Classical SIFT with Lowe's ratio test (and LoFTR if model provided)
+      - 'hybrid'    : Try structural matching first; fallback to classical if < 8 matches
 
     Parameters
     ----------
@@ -331,14 +339,31 @@ def run_dense_matching(
     img_b             : (H, W) float64 ndarray
     model             : optional pre-loaded matcher model (LoFTR)
     confidence_thresh : minimum match confidence [0.0, 1.0]
-    method            : 'classical' or 'structural' (default: 'classical')
+    method            : 'classical', 'structural', or 'hybrid' (default: 'classical')
+    feats_a, feats_b  : optional precomputed structural features
 
     Returns
     -------
     matches : (N, 5) float64 array of [x1, y1, x2, y2, confidence]
     """
-    if method.lower() == 'structural':
-        return run_structural_matching(img_a, img_b, confidence_thresh=confidence_thresh)
+    method_lower = method.lower()
+    if method_lower == 'structural':
+        return run_structural_matching(
+            img_a, img_b,
+            confidence_thresh=confidence_thresh,
+            feats_a=feats_a, feats_b=feats_b,
+        )
+
+    if method_lower == 'hybrid':
+        s_matches = run_structural_matching(
+            img_a, img_b,
+            confidence_thresh=confidence_thresh,
+            feats_a=feats_a, feats_b=feats_b,
+        )
+        if len(s_matches) >= 8:
+            logger.info(f"Hybrid matcher: using structural matches ({len(s_matches)} found)")
+            return s_matches
+        logger.info(f"Hybrid matcher: structural found {len(s_matches)} (< 8); falling back to classical SIFT/ORB")
 
     # Try LoFTR if model provided or Kornia available
     if model is not None and _HAS_KORNIA:
