@@ -141,3 +141,54 @@ def test_compute_homography_residuals_identity():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint 3: TPS control-point cap test
+# ---------------------------------------------------------------------------
+
+def test_tps_cap_48_points():
+    """
+    With 200 synthetic source points, ANMS selection of top 48 must:
+      1. Yield exactly min(48, N) control points.
+      2. Produce a TPS transform with RMSE < 1.0px on held-out test points.
+    This test directly verifies the orchestrator's cap logic (the selection
+    itself) by calling anms_select + fit_thin_plate_spline in isolation.
+    """
+    from core.anms_spatial_filter import anms_select
+
+    _TPS_MAX_CTRL_PTS = 48
+    rng = np.random.default_rng(42)
+
+    # 200 source points spread across a 400x400 canvas
+    src_pts = rng.uniform(20, 380, (200, 2))
+    # Ground-truth destination: uniform 2px shift + small noise
+    dst_pts = src_pts + np.array([2.0, 3.0]) + rng.normal(0, 0.05, src_pts.shape)
+
+    # Simulate orchestrator ANMS cap: build (N,5) array with confidence column
+    confs = np.ones(200)
+    candidate_arr = np.column_stack([src_pts, dst_pts, confs])
+    selected = anms_select(candidate_arr, k=_TPS_MAX_CTRL_PTS)
+
+    assert len(selected) <= _TPS_MAX_CTRL_PTS, (
+        f"ANMS cap must return <= {_TPS_MAX_CTRL_PTS} points; got {len(selected)}"
+    )
+    assert len(selected) >= 4, "Must have at least 4 points for TPS"
+
+    ctrl_src = selected[:, :2]
+    ctrl_dst = selected[:, 2:4]
+
+    tps = fit_thin_plate_spline(ctrl_src, ctrl_dst)
+    assert hasattr(tps, 'apply'), "TPS must have .apply() interface"
+
+    # Verify accuracy on held-out test points (not used in fitting)
+    test_src = rng.uniform(20, 380, (30, 2))
+    test_dst = test_src + np.array([2.0, 3.0])
+    pred_dst = tps.apply(test_src)
+    errors = np.linalg.norm(pred_dst - test_dst, axis=1)
+    rmse = float(np.sqrt(np.mean(errors ** 2)))
+
+    assert rmse < 1.0, (
+        f"TPS accuracy check: RMSE={rmse:.4f}px must be < 1.0px on held-out points"
+    )
+

@@ -369,10 +369,39 @@ class LunaMatchPipeline:
 
             if use_tps:
                 logger.info("  Relief parallax detected — fitting Thin Plate Spline")
-                transform = fit_thin_plate_spline(
-                    pts_a[inlier_mask], pts_b[inlier_mask]
+                # Cap TPS to top 48 ANMS-ranked control points.
+                # TPS RBFInterpolator solves an O(N^3) linear system — beyond ~50 points,
+                # accuracy gains plateau while solve time cubes.
+                _TPS_MAX_CTRL_PTS = 48
+                tps_src = pts_a[inlier_mask]
+                tps_dst = pts_b[inlier_mask]
+                n_tps_in = len(tps_src)
+
+                if n_tps_in > _TPS_MAX_CTRL_PTS:
+                    # ANMS-select the top _TPS_MAX_CTRL_PTS spatially distributed points
+                    tps_confs = (inlier_matches[:, 4]
+                                 if inlier_matches.shape[1] >= 5
+                                 else np.ones(n_tps_in))
+                    tps_candidate_arr = np.column_stack([tps_src, tps_dst, tps_confs])
+                    tps_selected = anms_select(tps_candidate_arr, k=_TPS_MAX_CTRL_PTS)
+                    tps_src = tps_selected[:, :2]
+                    tps_dst = tps_selected[:, 2:4]
+                    logger.info(
+                        f"  TPS control point cap: {n_tps_in} -> {len(tps_src)} "
+                        f"(top {_TPS_MAX_CTRL_PTS} ANMS-ranked)"
+                    )
+
+                t_tps_start = time.perf_counter()
+                transform = fit_thin_plate_spline(tps_src, tps_dst)
+                tps_fit_ms = round((time.perf_counter() - t_tps_start) * 1000, 1)
+                self.stage_timings_ms['tps_fit_ms'] = tps_fit_ms
+                self.stage_timings_ms['tps_n_ctrl_pts'] = len(tps_src)
+                logger.info(
+                    f"  TPS fit: {len(tps_src)} ctrl pts, "
+                    f"fit_time={tps_fit_ms}ms"
                 )
                 transform_type = 'tps'
+
             else:
                 transform      = H_matrix
                 transform_type = 'homography'
