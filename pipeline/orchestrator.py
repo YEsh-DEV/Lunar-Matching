@@ -422,7 +422,9 @@ class LunaMatchPipeline:
             pts_b = matches_full[:, 2:4]
 
             reproj_thresh = 3.0 * max(scale_a_x, 1.0) if is_large else 3.0
-            inlier_mask, H_matrix = magsac_filter(pts_a, pts_b, reprojection_threshold=reproj_thresh)
+            inlier_mask, H_matrix, fitted_type, condition_number = magsac_filter(
+                pts_a, pts_b, reprojection_threshold=reproj_thresh, return_details=True
+            )
 
             if inlier_mask.sum() < 4:
                 raise RuntimeError(
@@ -479,14 +481,15 @@ class LunaMatchPipeline:
 
             else:
                 transform      = H_matrix
-                transform_type = 'homography'
+                transform_type = fitted_type
 
             # Serialize transform parameters to JSON for cross-agent use
             transform_info = {
-                'type'          : transform_type,
-                'n_inliers'     : int(inlier_mask.sum()),
-                'n_candidates'  : int(len(matches_anms)),
-                'inlier_ratio'  : float(inlier_mask.mean()),
+                'type'             : transform_type,
+                'condition_number' : round(float(condition_number), 2) if condition_number is not None and not np.isinf(condition_number) else None,
+                'n_inliers'        : int(inlier_mask.sum()),
+                'n_candidates'     : int(len(matches_anms)),
+                'inlier_ratio'     : float(inlier_mask.mean()),
             }
             if H_matrix is not None:
                 transform_info['homography'] = H_matrix.tolist()
@@ -651,6 +654,8 @@ class LunaMatchPipeline:
                 'n_total'              : int(len(matches_anms)),
                 'elapsed_s'            : round(time.time() - self._start_time, 2),
                 'transform'            : transform_type,
+                'transform_type'       : transform_type,
+                'condition_number'     : round(float(condition_number), 2) if condition_number is not None and not np.isinf(condition_number) else None,
                 'is_synthetic_fallback': False,
                 'stage_timings_ms'     : self.stage_timings_ms,
                 'craters_detected_a'   : len(craters_a),

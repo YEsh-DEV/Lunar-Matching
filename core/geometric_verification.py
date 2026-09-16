@@ -15,6 +15,7 @@ References:
 
 import numpy as np
 import logging
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,97 @@ class ThinPlateSplineTransform:
 
 _MIN_MATCH_POINTS = 8   # minimum for reliable homography estimation
 
+def compute_condition_number(matrix: Optional[np.ndarray]) -> float:
+    """
+    Compute condition number kappa = sigma_max / sigma_min via SVD.
+    For affine / similarity transforms (2x3 or 3x3 with [0, 0, 1] bottom row),
+    evaluates the condition number of the linear 2x2 transformation block.
+    For projective homographies, evaluates the full 3x3 matrix.
+    Returns float('inf') for singular or None matrices.
+    """
+    if matrix is None:
+        return float("inf")
+    try:
+        mat = np.asarray(matrix, dtype=np.float64)
+        if mat.shape == (2, 3):
+            s = np.linalg.svd(mat[:, :2], compute_uv=False)
+        elif mat.shape == (3, 3) and abs(mat[2, 0]) < 1e-7 and abs(mat[2, 1]) < 1e-7 and abs(mat[2, 2] - 1.0) < 1e-3:
+            s = np.linalg.svd(mat[:2, :2], compute_uv=False)
+        else:
+            s = np.linalg.svd(mat, compute_uv=False)
+
+        sigma_max = float(s[0])
+        sigma_min = float(s[-1])
+        if sigma_min <= 1e-15:
+            return 1e15
+        return float(sigma_max / sigma_min)
+    except Exception:
+        return float("inf")
+
+
+def refit_with_condition_fallback(
+    pts_a: np.ndarray,
+    pts_b: np.ndarray,
+    H: np.ndarray,
+    kappa_threshold: float = 1e4,
+) -> Tuple[np.ndarray, str, float]:
+    """
+    Check condition number kappa = sigma_max / sigma_min via SVD.
+    If kappa > 1e4:
+      1. Refit as affine (cv2.estimateAffine2D or cv2.estimateAffinePartial2D).
+      2. If still degenerate (kappa > 1e4), refit as similarity (4-DOF via cv2.estimateAffinePartial2D).
+    Returns (transform_3x3, transform_type, condition_number).
+    """
+    kappa = compute_condition_number(H)
+    if kappa <= kappa_threshold:
+        return H, "homography", kappa
+
+    logger.warning(
+        f"Homography condition number kappa={kappa:.2e} exceeds threshold {kappa_threshold:.0e}. "
+        "Triggering model fallback hierarchy..."
+    )
+
+    if not _HAS_CV2 or len(pts_a) < 3:
+        return H, "homography", kappa
+
+    src = pts_a.reshape(-1, 1, 2).astype(np.float64)
+    dst = pts_b.reshape(-1, 1, 2).astype(np.float64)
+
+    # Step 1: Attempt affine (6-DOF)
+    M_aff = None
+    kappa_aff = float("inf")
+    try:
+        M_aff, _ = cv2.estimateAffine2D(src, dst)
+        if M_aff is not None:
+            H_aff = np.eye(3, dtype=np.float64)
+            H_aff[:2, :] = M_aff
+            kappa_aff = compute_condition_number(H_aff)
+            if kappa_aff <= kappa_threshold:
+                logger.info(f"Fallback to affine successful: kappa={kappa_aff:.2e}")
+                return H_aff, "affine", kappa_aff
+    except Exception as e_aff:
+        logger.debug(f"estimateAffine2D failed: {e_aff}")
+
+    # Step 2: Still degenerate or failed: refit as similarity (4-DOF) via cv2.estimateAffinePartial2D
+    logger.warning(
+        f"Affine refit still degenerate (kappa={kappa_aff:.2e} > {kappa_threshold:.0e}). "
+        "Falling back to similarity (4-DOF) via cv2.estimateAffinePartial2D..."
+    )
+    try:
+        M_sim, _ = cv2.estimateAffinePartial2D(src, dst)
+        if M_sim is not None:
+            H_sim = np.eye(3, dtype=np.float64)
+            H_sim[:2, :] = M_sim
+            kappa_sim = compute_condition_number(H_sim)
+            logger.info(f"Fallback to similarity successful: kappa={kappa_sim:.2e}")
+            return H_sim, "similarity", kappa_sim
+    except Exception as e_sim:
+        logger.warning(f"estimateAffinePartial2D failed: {e_sim}")
+
+    # If all refits fail, return original H
+    return H, "homography", kappa
+
+
 def magsac_filter(
     pts_a: np.ndarray,
     pts_b: np.ndarray,
@@ -83,27 +175,25 @@ def magsac_filter(
     confidence: float = 0.999,
     max_iterations: int = 10000,
     reprojection_threshold: float = 3.0,
+    return_details: bool = False,
 ) -> tuple:
     """
-    Filter matches using MAGSAC++ (threshold-free marginalizing robust estimator).
-
-    Uses cv2.findHomography with method=cv2.USAC_MAGSAC (OpenCV 4.8+).
-    MAGSAC++ marginalizes over the noise scale sigma rather than using a
-    hard inlier threshold -- producing more accurate inlier/outlier decisions.
+    Robust geometric verification using MAGSAC++.
 
     Parameters
     ----------
-    pts_a : (N, 2) float64 -- pixel coords (x, y) in image A
-    pts_b : (N, 2) float64 -- pixel coords (x, y) in image B
-    model : 'homography' (only option for now; future: 'fundamental')
-    confidence : RANSAC confidence (0.999 recommended for planetary data)
+    pts_a : (N, 2) float array of keypoint coords in image A
+    pts_b : (N, 2) float array of keypoint coords in image B
+    model : 'homography' (default; cv2.USAC_MAGSAC)
+    confidence : RANSAC confidence parameter
     max_iterations : maximum RANSAC/MAGSAC iterations
     reprojection_threshold : fallback threshold (MAGSAC++ marginalizes this)
+    return_details : if True, returns (inlier_mask, H, transform_type, condition_number)
 
     Returns
     -------
     inlier_mask : (N,) bool array -- True = geometric inlier
-    H_matrix    : (3, 3) float64 homography matrix, or None if estimation fails
+    H_matrix    : (3, 3) float64 transform matrix, or None if estimation fails
     """
     N = len(pts_a)
 
@@ -113,6 +203,8 @@ def magsac_filter(
             f"MAGSAC: only {N} points supplied; minimum is {_MIN_MATCH_POINTS}. "
             "Returning all-False inlier mask."
         )
+        if return_details:
+            return np.zeros(N, dtype=bool), None, "none", float("inf")
         return np.zeros(N, dtype=bool), None
 
     if not _HAS_CV2:
@@ -136,6 +228,8 @@ def magsac_filter(
 
     except cv2.error as e:
         logger.error(f"MAGSAC++ failed with OpenCV error: {e}")
+        if return_details:
+            return np.zeros(N, dtype=bool), None, "none", float("inf")
         return np.zeros(N, dtype=bool), None
 
     # Handle failure modes
@@ -144,27 +238,33 @@ def magsac_filter(
             "MAGSAC++ returned None (all-outlier failure or degenerate config). "
             "Returning all-False inlier mask."
         )
+        if return_details:
+            return np.zeros(N, dtype=bool), None, "none", float("inf")
         return np.zeros(N, dtype=bool), None
 
-    # Check for degenerate homography (near-singular matrix)
-    try:
-        cond = np.linalg.cond(H)
-        if cond > 1e10:
-            logger.warning(
-                f"Homography matrix is near-singular (cond={cond:.2e}). "
-                "Result may be unreliable."
-            )
-    except np.linalg.LinAlgError:
-        logger.warning("Could not compute condition number of homography.")
-
     inlier_mask = mask.ravel().astype(bool)
+
+    # Condition number check via SVD and fallback hierarchy
+    kappa = compute_condition_number(H)
+    transform_type = "homography"
+    condition_number = kappa
+
+    if kappa > 1e4:
+        inliers_a = pts_a[inlier_mask]
+        inliers_b = pts_b[inlier_mask]
+        if len(inliers_a) >= 3:
+            H, transform_type, condition_number = refit_with_condition_fallback(
+                inliers_a, inliers_b, H, kappa_threshold=1e4
+            )
 
     n_inliers = inlier_mask.sum()
     logger.info(
         f"MAGSAC++: {N} candidates → {n_inliers} inliers "
-        f"({100.0 * n_inliers / N:.1f}% inlier ratio)"
+        f"({100.0 * n_inliers / N:.1f}% inlier ratio) | type={transform_type} kappa={condition_number:.2e}"
     )
 
+    if return_details:
+        return inlier_mask, H.astype(np.float64), transform_type, condition_number
     return inlier_mask, H.astype(np.float64)
 
 

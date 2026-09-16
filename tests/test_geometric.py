@@ -192,3 +192,34 @@ def test_tps_cap_48_points():
         f"TPS accuracy check: RMSE={rmse:.4f}px must be < 1.0px on held-out points"
     )
 
+
+def test_condition_number_fallback_near_collinear():
+    """
+    Synthetic near-collinear points cause homography to have condition number kappa > 1e4.
+    Verify that magsac_filter triggers fallback to affine/similarity and condition_number <= 1e4.
+    """
+    dy = 1e-4
+    pts_a = np.array([
+        [0.0, 0.0],
+        [100.0, dy],
+        [200.0, -dy],
+        [300.0, 2*dy],
+        [400.0, -2*dy],
+        [500.0, dy],
+        [600.0, -dy],
+        [700.0, 2*dy],
+    ])
+    pts_b = pts_a.copy()
+    pts_b[:, 0] += 50.0
+    pts_b[2, 0] += 0.5
+
+    mask, model, transform_type, cond = magsac_filter(pts_a, pts_b, return_details=True)
+
+    assert transform_type in ("affine", "similarity"), (
+        f"Expected fallback to affine or similarity; got {transform_type}"
+    )
+    assert cond <= 1e4, f"Expected condition number <= 1e4 after fallback; got {cond}"
+    assert model is not None
+    assert model.shape == (3, 3)
+
+
