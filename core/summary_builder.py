@@ -222,6 +222,10 @@ def _ensure_visual_artifacts(job_dir: Path, root: Path) -> Dict[str, Optional[st
         "tiepoints_png": None,
         "residual_map_png": None,
         "craters_png": None,
+        "graph_residual_scatter": None,
+        "graph_residual_histogram": None,
+        "graph_crater_histogram": None,
+        "graph_confidence_gauge": None,
     }
 
     # 1. Registered GeoTIFF / Raster
@@ -375,6 +379,17 @@ def _ensure_visual_artifacts(job_dir: Path, root: Path) -> Dict[str, Optional[st
         craters_png = out_dir / "craters_a.png"
     if craters_png.exists():
         artifacts["craters_png"] = _to_relative_path(craters_png, root)
+
+    # 6. Graph Artifacts
+    for graph_key in [
+        "graph_residual_scatter",
+        "graph_residual_histogram",
+        "graph_crater_histogram",
+        "graph_confidence_gauge",
+    ]:
+        gp = out_dir / f"{graph_key}.png"
+        if gp.exists():
+            artifacts[graph_key] = _to_relative_path(gp, root)
 
     return artifacts
 
@@ -571,6 +586,15 @@ def build_chatbot_summary(
 
     # 5. Visual Artifacts
     artifacts = _ensure_visual_artifacts(job_dir, root)
+    graphs_info = metrics_raw.get("graphs", {}) if isinstance(metrics_raw.get("graphs"), dict) else {}
+    for g_key in [
+        "graph_residual_scatter",
+        "graph_residual_histogram",
+        "graph_crater_histogram",
+        "graph_confidence_gauge",
+    ]:
+        if g_key in graphs_info:
+            artifacts[g_key] = graphs_info[g_key]
 
     # Clean numeric metrics for client (remove internal keys)
     client_metrics = {

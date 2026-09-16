@@ -20,12 +20,60 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Union
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 _io_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _render_all_graphs_bg(job_id: str, output_dir: Path, refined_matches: Optional[np.ndarray], craters: list, metrics_summary: dict) -> None:
+    try:
+        from core.graph_renderer import (
+            render_residual_scatter,
+            render_residual_histogram,
+            render_crater_histogram,
+            render_confidence_gauge,
+        )
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        p_scatter = output_dir / "graph_residual_scatter.png"
+        p_hist = output_dir / "graph_residual_histogram.png"
+        p_crater = output_dir / "graph_crater_histogram.png"
+        p_gauge = output_dir / "graph_confidence_gauge.png"
+
+        if refined_matches is not None and len(refined_matches) > 0 and refined_matches.shape[1] >= 4:
+            src = refined_matches[:, :2]
+            dst = refined_matches[:, 2:4]
+            res_mags = np.linalg.norm(dst - src, axis=1)
+        else:
+            src = np.empty((0, 2))
+            dst = np.empty((0, 2))
+            res_mags = np.empty((0,))
+
+        render_residual_scatter(src, dst, str(p_scatter))
+        render_residual_histogram(res_mags, str(p_hist))
+        render_crater_histogram(craters or [], str(p_crater))
+
+        rmse = metrics_summary.get("rmse_px", 999.0)
+        inlier_ratio = metrics_summary.get("inlier_ratio", 0.0)
+        n_inliers = metrics_summary.get("n_inliers", 0)
+        sdi = metrics_summary.get("sdi", 0.0)
+
+        grade = "B"
+        label = "moderate confidence"
+        if rmse <= 1.0 and ((n_inliers >= 8 and inlier_ratio >= 0.20) or (inlier_ratio >= 0.70 and n_inliers >= 6)) and sdi >= 0.20:
+            grade = "A"
+            label = "high confidence"
+        elif rmse > 2.0:
+            grade = "C"
+            label = "low confidence"
+
+        render_confidence_gauge(grade, label, str(p_gauge))
+    except Exception as e:
+        logger.warning(f"Background graph generation failed for {job_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +174,15 @@ class LunaMatchPipeline:
             'registered'         : base / "output" / "registered.tif",
             'residual_map'       : base / "output" / "residual_map.png",
             'craters_overlay_a'  : base / "output" / "craters_a.png",
-            'craters_overlay_b'  : base / "output" / "craters_b.png",
-            'control_points_csv' : base / "output" / "control_points.csv",
-            'metrics'            : base / "output" / "metrics.json",
+            'craters_overlay_b'        : base / "output" / "craters_b.png",
+            'control_points_csv'       : base / "output" / "control_points.csv",
+            'metrics'                  : base / "output" / "metrics.json",
+            'graph_residual_scatter'   : base / "output" / "graph_residual_scatter.png",
+            'graph_residual_histogram' : base / "output" / "graph_residual_histogram.png",
+            'graph_crater_histogram'   : base / "output" / "graph_crater_histogram.png",
+            'graph_confidence_gauge'   : base / "output" / "graph_confidence_gauge.png",
         }
+        self.output_dir = base / "output"
 
         # Ensure dirs exist
         os.makedirs(base / "input",        exist_ok=True)
@@ -755,6 +808,12 @@ class LunaMatchPipeline:
                 'stage_timings_ms'     : self.stage_timings_ms,
                 'craters_detected_a'   : len(craters_a),
                 'craters_detected_b'   : len(craters_b),
+                'graphs'               : {
+                    'graph_residual_scatter'   : f"data/jobs/{self.job_id}/output/graph_residual_scatter.png",
+                    'graph_residual_histogram' : f"data/jobs/{self.job_id}/output/graph_residual_histogram.png",
+                    'graph_crater_histogram'   : f"data/jobs/{self.job_id}/output/graph_crater_histogram.png",
+                    'graph_confidence_gauge'   : f"data/jobs/{self.job_id}/output/graph_confidence_gauge.png",
+                },
             }
 
             # Ensure background image writes complete
@@ -766,6 +825,16 @@ class LunaMatchPipeline:
 
             with open(self.paths['metrics'], 'w') as f:
                 json.dump(metrics, f, indent=2)
+
+            # Pre-generate all 4 graph PNGs in background thread (never blocks critical path)
+            _io_executor.submit(
+                _render_all_graphs_bg,
+                self.job_id,
+                self.output_dir,
+                refined_matches,
+                craters_a,
+                metrics,
+            )
 
             self._write_status(JobState.DONE)
 

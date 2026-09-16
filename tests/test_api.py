@@ -220,3 +220,65 @@ def test_api_structured_error_taxonomy_contract(client):
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
+def test_graphs_invalid_kind_returns_400_with_valid_values_list(client):
+    """GET /graphs with invalid kind returns 400 with ErrorCode.INVALID_KIND and valid_values."""
+    resp = client.get("/jobs/test_job_dummy/graphs?kind=nonexistent_chart_type")
+    assert resp.status_code == 400
+    data = resp.json()
+    detail = data.get("detail", data)
+    assert detail.get("error_code") == "INVALID_KIND"
+    assert "valid_values" in detail
+    for k in ["residual_scatter", "residual_histogram", "crater_histogram", "confidence_gauge"]:
+        assert k in detail["valid_values"]
+
+
+def test_graphs_job_not_done_returns_409(client):
+    """GET /graphs for a job not in DONE state returns 409 JOB_NOT_DONE."""
+    import json
+    job_id = "test_graphs_pending_job_001"
+    job_dir = Path("data") / "jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(job_dir / "status.json", "w") as f:
+            json.dump({"job_id": job_id, "status": "MATCHING"}, f)
+        resp = client.get(f"/jobs/{job_id}/graphs?kind=confidence_gauge")
+        assert resp.status_code == 409
+        data = resp.json()
+        assert data.get("error_code") == "JOB_NOT_DONE"
+        assert data.get("job_id") == job_id
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def test_graphs_job_not_found_returns_404(client):
+    """GET /graphs for a nonexistent job returns 404 JOB_NOT_FOUND."""
+    resp = client.get("/jobs/nonexistent_job_999999/graphs?kind=residual_scatter")
+    assert resp.status_code == 404
+    data = resp.json()
+    assert data.get("error_code") == "JOB_NOT_FOUND"
+
+
+def test_graphs_confidence_gauge_returns_png_for_done_job(client):
+    """Hit /graphs?kind=confidence_gauge on a real completed job, verify 200 + image/png."""
+    p_a = "data/samples/verified_a.tif"
+    p_b = "data/samples/verified_b.tif"
+    job_id = "test_graphs_done_job_001"
+    try:
+        resp_reg = client.post("/register", json={
+            "img_a_path": p_a,
+            "img_b_path": p_b,
+            "job_id": job_id,
+            "mode": "fast",
+        })
+        assert resp_reg.status_code == 202
+
+        resp = client.get(f"/jobs/{job_id}/graphs?kind=confidence_gauge")
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "image/png"
+        assert len(resp.content) > 0
+    finally:
+        shutil.rmtree(Path("data") / "jobs" / job_id, ignore_errors=True)
+
+
+
+
