@@ -160,3 +160,33 @@ def test_history_capped_at_10_turns(client, completed_job_dir):
 
     history = explain_sessions[completed_job_dir]["history"]
     assert len(history) <= 20
+
+
+def test_explain_query_bypasses_fast_path(client, completed_job_dir):
+    client.post(f"/agent/explain/{completed_job_dir}/start")
+    resp = client.post(
+        f"/agent/explain/{completed_job_dir}/message",
+        json={"query": "explain why the pipeline chose homography instead of TPS"}
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        assert data.get("used_fast_path") is False
+    else:
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data.get("error_code") == "GROQ_API_KEY_MISSING"
+
+
+def test_why_query_bypasses_fast_path(client, completed_job_dir):
+    client.post(f"/agent/explain/{completed_job_dir}/start")
+    resp = client.post(
+        f"/agent/explain/{completed_job_dir}/message",
+        json={"query": "why is the inlier ratio important"}
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        assert data.get("used_fast_path") is False
+    else:
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data.get("error_code") == "GROQ_API_KEY_MISSING"

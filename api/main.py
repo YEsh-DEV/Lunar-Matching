@@ -864,6 +864,24 @@ research_sessions: dict[str, dict] = {}
 # Pre-fetched RAG cache for common questions
 _rag_prefetch_cache: dict[str, list[dict]] = {}
 
+GENERATIVE_OVERRIDE_WORDS = [
+    r'\bexplain\b',
+    r'\bwhy\b',
+    r'\bdescribe\b',
+    r'\btell me about\b',
+    r'\bwhat does\b',
+    r'\bwhat do\b',
+    r'\bsuitable\b',
+    r'\bimportant\b',
+    r'\bsignifican',
+    r'\bcaused?\b',
+    r'\bmeaning\b',
+    r'\binterpret\b',
+    r'\bhow does\b',
+    r'\bcan i use\b',
+    r'\bshould i\b',
+]
+
 FAST_PATH_PATTERNS = [
     (r"\brmse\b", "rmse_px"),
     (r"\binlier", "inlier_ratio"),
@@ -887,9 +905,13 @@ def _try_fast_path(query: str, summary: dict) -> Optional[str]:
     For matched field: extract value from summary["metrics"] or
     summary["quality_assessment"] and format a one-sentence answer.
     """
+    query_lower = query.lower()
+    for override in GENERATIVE_OVERRIDE_WORDS:
+        if re.search(override, query_lower):
+            return None  # force generative path
+
     metrics = summary.get("metrics", {})
     qa = summary.get("quality_assessment", {})
-    query_lower = query.lower()
 
     for pattern, field in FAST_PATH_PATTERNS:
         if re.search(pattern, query_lower):
