@@ -65,11 +65,17 @@ def main():
             }
             print(f"[{name}] Result Status: {result.get('status')}")
             if result.get("status") == "DONE":
-                print(f"    RMSE: {result.get('rmse_px')} px")
-                print(f"    Inlier Ratio: {result.get('inlier_ratio')*100:.1f}% ({result.get('n_inliers')}/{result.get('n_total')})")
-                print(f"    SDI: {result.get('sdi')}")
-                print(f"    Transform: {result.get('transform')}")
-                print(f"    Elapsed: {elapsed}s")
+                print(f"    RMSE:            {result.get('rmse_px')} px")
+                print(f"    Held-Out RMSE:   {result.get('held_out_rmse_px')} px")
+                print(f"    Overfit Ratio:   {result.get('overfit_ratio')}")
+                print(f"    MAE:             {result.get('mae_px')} px")
+                print(f"    SSIM:            {result.get('ssim')}")
+                print(f"    NCC:             {result.get('ncc')}")
+                print(f"    Inlier Ratio:    {result.get('inlier_ratio')*100:.1f}% ({result.get('n_inliers')}/{result.get('n_total')})")
+                print(f"    SDI:             {result.get('sdi')}")
+                print(f"    Transform:       {result.get('transform_type') or result.get('transform')}")
+                print(f"    Condition No:    {result.get('condition_number')}")
+                print(f"    Elapsed:         {elapsed}s")
             else:
                 print(f"    Stage: {result.get('stage')}")
                 print(f"    Error: {result.get('error')}")
@@ -96,6 +102,41 @@ def main():
     print("\n" + "=" * 80)
     print(f"Saved comprehensive results to: {summary_path}")
     print("=" * 80)
+
+    # Print markdown summary table
+    print("\n" + "=" * 100)
+    print("SUMMARY TABLE")
+    print("=" * 100)
+    headers = ["Pair", "Status", "Elapsed(s)", "RMSE(px)", "Held-Out RMSE", "Overfit Ratio", "MAE(px)", "SSIM", "NCC", "Inliers", "SDI", "Transform", "Kappa"]
+    print(f"| {' | '.join(headers)} |")
+    print(f"| {' | '.join(['---'] * len(headers))} |")
+    for name, path_a, path_b, diff in pairs:
+        res_info = all_results.get(name, {})
+        res = res_info.get("result", {})
+        status = res_info.get("status", "FAIL")
+        elapsed = res.get("bench_elapsed_s", res_info.get("bench_elapsed_s", "-"))
+        elapsed_str = f"{elapsed:.2f}" if isinstance(elapsed, (int, float)) else str(elapsed)
+        if status == "DONE":
+            row = [
+                name,
+                status,
+                elapsed_str,
+                f"{res.get('rmse_px', '-'):.4f}" if isinstance(res.get('rmse_px'), (int, float)) else str(res.get('rmse_px')),
+                f"{res.get('held_out_rmse_px', '-'):.4f}" if isinstance(res.get('held_out_rmse_px'), (int, float)) else str(res.get('held_out_rmse_px')),
+                f"{res.get('overfit_ratio', '-'):.4f}" if isinstance(res.get('overfit_ratio'), (int, float)) else str(res.get('overfit_ratio')),
+                f"{res.get('mae_px', '-'):.4f}" if isinstance(res.get('mae_px'), (int, float)) else str(res.get('mae_px')),
+                f"{res.get('ssim', '-'):.4f}" if isinstance(res.get('ssim'), (int, float)) else str(res.get('ssim')),
+                f"{res.get('ncc', '-'):.4f}" if isinstance(res.get('ncc'), (int, float)) else str(res.get('ncc')),
+                f"{res.get('n_inliers')}/{res.get('n_total')}",
+                f"{res.get('sdi', '-'):.4f}" if isinstance(res.get('sdi'), (int, float)) else str(res.get('sdi')),
+                str(res.get('transform_type') or res.get('transform')),
+                f"{res.get('condition_number'):.2f}" if isinstance(res.get('condition_number'), (int, float)) else str(res.get('condition_number')),
+            ]
+        else:
+            err = res_info.get("error") or res.get("error") or "FAIL"
+            row = [name, status, elapsed_str, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
+        print(f"| {' | '.join(row)} |")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
