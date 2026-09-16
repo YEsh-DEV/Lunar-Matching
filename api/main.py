@@ -14,10 +14,13 @@ Exposes core endpoints:
 import os
 import json
 import uuid
+import re
+import time
 import logging
 import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -27,10 +30,21 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, SummaryResponse, ChatbotSummaryResponse
+from api.schemas import (
+    RegisterRequest,
+    JobStatusResponse,
+    JobResultResponse,
+    SummaryResponse,
+    ChatbotSummaryResponse,
+    AgentMessageRequest,
+    SourceRef,
+    AgentMessageResponse,
+    ResearchSessionResponse,
+)
 from api.errors import ErrorCode, APIError, api_error_response
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
+from core.agent_rag import retrieve, format_for_prompt
 from core.warp_and_eval import export_control_points_csv
 from core.dense_matcher import _check_loftr_available, LoFTRUnavailableError
 from core.graph_renderer import (
@@ -92,7 +106,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             try:
                 code = ErrorCode(detail["error_code"])
             except ValueError:
-                code = ErrorCode.INTERNAL_ERROR
+                code = detail["error_code"]
             msg = detail.get("message", msg)
     elif exc.status_code == 404:
         code = ErrorCode.JOB_NOT_FOUND
@@ -777,5 +791,334 @@ def get_job_graphs(job_id: str, kind: str = "residual_scatter"):
         error_code=ErrorCode.INTERNAL_ERROR,
         message=f"Failed to generate graph '{kind}'",
         job_id=job_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI Agent Explanation Layer & Research Companion
+# ---------------------------------------------------------------------------
+
+# Result Explainer: keyed by job_id
+# {job_id: {summary: dict, history: list[dict], created_at: datetime}}
+explain_sessions: dict[str, dict] = {}
+
+# Research Companion: keyed by session_id
+# {session_id: {history: list[dict], created_at: datetime}}
+research_sessions: dict[str, dict] = {}
+
+# Pre-fetched RAG cache for common questions
+_rag_prefetch_cache: dict[str, list[dict]] = {}
+
+FAST_PATH_PATTERNS = [
+    (r"\brmse\b", "rmse_px"),
+    (r"\binlier", "inlier_ratio"),
+    (r"\bsdi\b|\bspatial.{0,15}dispers", "sdi"),
+    (r"\bgrade\b|\breliable\b|\bconfidence\b", "grade"),
+    (r"\bssim\b", "ssim"),
+    (r"\bncc\b", "ncc"),
+    (r"\bmae\b|\bmean.{0,10}abs", "mae_px"),
+    (r"\binliers?\b|\bmatches\b|\btie.?point", "n_inliers"),
+    (r"\btransform\b|\bhomography\b|\baffine\b|\btps\b", "transform_type"),
+    (r"\belapsed\b|\btime\b|\bfast\b|\bslow\b|\blatency\b|\bspeed\b", "elapsed_s"),
+]
+
+
+def _try_fast_path(query: str, summary: dict) -> Optional[str]:
+    """
+    Check if query matches a known metric pattern.
+    If yes: return a formatted string answer using summary data directly.
+    If no: return None (falls through to generative path).
+    Use FAST_PATH_PATTERNS regex list. Case-insensitive.
+    For matched field: extract value from summary["metrics"] or
+    summary["quality_assessment"] and format a one-sentence answer.
+    """
+    metrics = summary.get("metrics", {})
+    qa = summary.get("quality_assessment", {})
+    query_lower = query.lower()
+
+    for pattern, field in FAST_PATH_PATTERNS:
+        if re.search(pattern, query_lower):
+            if field == "rmse_px":
+                rmse = metrics.get("rmse_px")
+                if rmse is not None:
+                    subpixel = " (sub-pixel accurate — below the 0.5px threshold)" if float(rmse) < 0.5 else ""
+                    return f"The reprojection RMSE is {float(rmse):.4f} px{subpixel}."
+                return "The reprojection RMSE is not available."
+            elif field in ("inlier_ratio", "n_inliers"):
+                n_inliers = metrics.get("n_inliers", 0)
+                n_total = metrics.get("n_total", 0)
+                ratio = metrics.get("inlier_ratio")
+                if ratio is not None:
+                    return f"{n_inliers} out of {n_total} candidates verified ({float(ratio)*100:.1f}% inlier ratio)."
+                return f"{n_inliers} out of {n_total} candidate matches verified."
+            elif field == "sdi":
+                sdi = metrics.get("sdi")
+                if sdi is not None:
+                    spread = "well-spread across the scene" if float(sdi) >= 0.6 else ("moderately spread" if float(sdi) >= 0.3 else "clustered in a localized region")
+                    return f"The Spatial Dispersion Index (SDI) is {float(sdi):.4f} ({spread})."
+                return "Spatial Dispersion Index (SDI) is not available."
+            elif field == "grade":
+                grade = qa.get("grade", "N/A")
+                conf = qa.get("confidence_label", "unknown")
+                reason = qa.get("reasoning", "")
+                return f"Grade {grade} — {conf}. {reason}".strip()
+            elif field == "ssim":
+                ssim = metrics.get("ssim")
+                if ssim is not None:
+                    return f"The Structural Similarity Index (SSIM) is {float(ssim):.4f}."
+                return "SSIM metric is not available."
+            elif field == "ncc":
+                ncc = metrics.get("ncc")
+                if ncc is not None:
+                    return f"The Normalized Cross-Correlation (NCC) is {float(ncc):.4f}."
+                return "NCC metric is not available."
+            elif field == "mae_px":
+                mae = metrics.get("mae_px")
+                if mae is not None:
+                    return f"The Mean Absolute Error (MAE) is {float(mae):.4f} px."
+                return "MAE metric is not available."
+            elif field == "transform_type":
+                tf = metrics.get("transform_type") or "homography"
+                cond = metrics.get("condition_number")
+                cond_str = f" with condition number {float(cond):.2f}" if cond is not None else ""
+                return f"Geometric transformation fitted: {tf}{cond_str}."
+            elif field == "elapsed_s":
+                elapsed = metrics.get("elapsed_s", 0.0)
+                return f"Registration completed in {float(elapsed):.2f} seconds."
+    return None
+
+
+def _call_groq_with_rag(
+    query: str,
+    summary: Optional[dict],
+    history: List[dict],
+    rag_context: str,
+) -> Tuple[str, float]:
+    """
+    Build system prompt grounding the LLM in:
+      1. rag_context (retrieved knowledge chunks)
+      2. summary metrics (if available — None for research companion)
+    Call Groq (via openai client or direct request with GROQ_API_KEY).
+    Return (reply_text, latency_ms).
+    """
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error_code": "GROQ_API_KEY_MISSING",
+                "message": "GROQ_API_KEY environment variable is not set.",
+            },
+        )
+
+    t0 = time.time()
+    metrics_str = f"Registration metrics:\n{json.dumps(summary['metrics'], indent=2)}\n" if summary and "metrics" in summary else ""
+    quality_str = f"Quality: {summary['quality_assessment']['reasoning']}\n" if summary and "quality_assessment" in summary and "reasoning" in summary["quality_assessment"] else ""
+
+    system_prompt = (
+        "You are LUNA-MATCH, a scientific assistant for lunar image registration. "
+        "Answer based only on the provided context and metrics. Do not invent numbers.\n\n"
+        f"{metrics_str}"
+        f"{quality_str}"
+        f"Scientific knowledge context:\n{rag_context}\n\n"
+        "Keep answers under 120 words unless asked for more detail."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history[-10:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": query})
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            base_url=os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+            api_key=groq_api_key,
+        )
+        model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=350,
+            temperature=0.2,
+        )
+        reply_text = response.choices[0].message.content or ""
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        logger.error(f"Groq API call failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_code": "GROQ_API_ERROR", "message": f"LLM inference failed: {str(e)}"},
+        )
+
+    latency_ms = (time.time() - t0) * 1000.0
+    return reply_text, latency_ms
+
+
+@app.post("/agent/explain/{job_id}/start")
+async def explain_start(job_id: str):
+    try:
+        summary = build_chatbot_summary(job_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "JOB_NOT_FOUND", "message": f"Job {job_id} not found.", "job_id": job_id},
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error_code": "INTERNAL_ERROR", "message": str(e), "job_id": job_id},
+        )
+
+    job_status = summary.get("status")
+    if job_status != "DONE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "JOB_NOT_DONE",
+                "message": f"Job {job_id} is not completed (current status: {job_status}).",
+                "job_id": job_id,
+            },
+        )
+
+    explain_sessions[job_id] = {
+        "summary": summary,
+        "history": [],
+        "created_at": datetime.now(),
+    }
+
+    def _prefetch():
+        try:
+            chunks_1 = retrieve("explain registration result", top_k=4)
+            chunks_2 = retrieve("is this reliable", top_k=4)
+            _rag_prefetch_cache[job_id] = {
+                "explain registration result": chunks_1,
+                "is this reliable": chunks_2,
+            }
+        except Exception as ex:
+            logger.warning(f"RAG prefetch failed for {job_id}: {ex}")
+
+    _executor.submit(_prefetch)
+
+    return {"job_id": job_id, "context_ready": True}
+
+
+@app.post("/agent/explain/{job_id}/message", response_model=AgentMessageResponse)
+async def explain_message(job_id: str, req: AgentMessageRequest):
+    if job_id not in explain_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "JOB_NOT_FOUND",
+                "message": f"Call POST /agent/explain/{job_id}/start first",
+                "job_id": job_id,
+            },
+        )
+
+    session = explain_sessions[job_id]
+    query = req.query.strip()
+    t0 = time.time()
+
+    fast_answer = _try_fast_path(query, session["summary"])
+    if fast_answer:
+        latency_ms = (time.time() - t0) * 1000.0
+        session["history"].append({"role": "user", "content": query})
+        session["history"].append({"role": "assistant", "content": fast_answer})
+        if len(session["history"]) > 20:
+            session["history"] = session["history"][-20:]
+        return AgentMessageResponse(
+            text_response=fast_answer,
+            used_fast_path=True,
+            latency_ms=latency_ms,
+            sources=[],
+        )
+
+    # Generative path
+    prefetch_dict = _rag_prefetch_cache.get(job_id, {})
+    if query in prefetch_dict:
+        chunks = prefetch_dict[query]
+    else:
+        chunks = retrieve(query, top_k=4)
+
+    prompt_context = format_for_prompt(chunks)
+    reply_text, latency_ms = _call_groq_with_rag(query, session["summary"], session["history"], prompt_context)
+
+    session["history"].append({"role": "user", "content": query})
+    session["history"].append({"role": "assistant", "content": reply_text})
+    if len(session["history"]) > 20:
+        session["history"] = session["history"][-20:]
+
+    sources = [
+        SourceRef(
+            source_file=c["source_file"],
+            section_title=c["section_title"],
+            score=float(c.get("score", 0.0)),
+        )
+        for c in chunks
+    ]
+
+    return AgentMessageResponse(
+        text_response=reply_text,
+        used_fast_path=False,
+        latency_ms=latency_ms,
+        sources=sources,
+    )
+
+
+@app.post("/research/session", response_model=ResearchSessionResponse)
+async def create_research_session():
+    now = datetime.now()
+    cutoff = now - timedelta(minutes=30)
+    expired = [sid for sid, sdata in list(research_sessions.items()) if sdata.get("created_at", now) < cutoff]
+    for sid in expired:
+        research_sessions.pop(sid, None)
+
+    session_id = str(uuid.uuid4())
+    research_sessions[session_id] = {
+        "history": [],
+        "created_at": now,
+    }
+    return ResearchSessionResponse(session_id=session_id)
+
+
+@app.post("/research/{session_id}/message", response_model=AgentMessageResponse)
+async def research_message(session_id: str, req: AgentMessageRequest):
+    if session_id not in research_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "JOB_NOT_FOUND",
+                "message": "Session expired or not found. Call POST /research/session to start.",
+            },
+        )
+
+    session = research_sessions[session_id]
+    query = req.query.strip()
+
+    chunks = retrieve(query, top_k=4)
+    prompt_context = format_for_prompt(chunks)
+    reply_text, latency_ms = _call_groq_with_rag(query, None, session["history"], prompt_context)
+
+    session["history"].append({"role": "user", "content": query})
+    session["history"].append({"role": "assistant", "content": reply_text})
+    if len(session["history"]) > 20:
+        session["history"] = session["history"][-20:]
+    session["created_at"] = datetime.now()
+
+    sources = [
+        SourceRef(
+            source_file=c["source_file"],
+            section_title=c["section_title"],
+            score=float(c.get("score", 0.0)),
+        )
+        for c in chunks
+    ]
+
+    return AgentMessageResponse(
+        text_response=reply_text,
+        used_fast_path=False,
+        latency_ms=latency_ms,
+        sources=sources,
     )
 

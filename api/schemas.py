@@ -93,3 +93,26 @@ class SummaryResponse(BaseModel):
 ChatbotSummaryResponse = SummaryResponse
 
 
+class AgentMessageRequest(BaseModel):
+    query: str
+    stream: bool = False   # False for now — streaming is future scope
+
+
+class SourceRef(BaseModel):
+    source_file: str
+    section_title: str
+    score: float
+
+
+class AgentMessageResponse(BaseModel):
+    text_response: str
+    used_fast_path: bool
+    latency_ms: float
+    sources: List[SourceRef] = []
+    error_code: Optional[str] = None
+
+
+class ResearchSessionResponse(BaseModel):
+    session_id: str
+
+

@@ -161,3 +161,25 @@ Query parameter: `kind={residual_scatter|residual_histogram|crater_histogram|con
   }
 }
 ```
+
+## 6. AI Explanation Layer Endpoints
+
+### POST /agent/explain/{job_id}/start
+Must be called once after job reaches DONE. Loads job summary and
+pre-fetches RAG context.
+Response: {"job_id": str, "context_ready": bool}
+
+### POST /agent/explain/{job_id}/message
+Request: {"query": str}
+Response: {"text_response": str, "used_fast_path": bool,
+           "latency_ms": float, "sources": [...]}
+Fast path (<50ms): direct metric lookup for RMSE/inlier/grade/SDI queries.
+Generative path (~1-3s): RAG + Groq LLM grounded in job metrics.
+
+### POST /research/session
+Response: {"session_id": str}
+General lunar science Q&A, no job context required.
+
+### POST /research/{session_id}/message
+Same response schema as explain/message. Always uses generative path.
+Session expires after 30 min idle.
