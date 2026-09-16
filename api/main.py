@@ -28,6 +28,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
 from api.schemas import (
@@ -1175,4 +1176,61 @@ async def research_message(session_id: str, req: AgentMessageRequest):
         latency_ms=latency_ms,
         sources=sources,
     )
+
+
+# ---------------------------------------------------------------------------
+# Compatibility & Analysis Routes
+# ---------------------------------------------------------------------------
+
+class ChatMessageRequest(BaseModel):
+    job_id: str
+    message: str
+    session_id: Optional[str] = None
+
+
+@app.post("/chat")
+async def chat_endpoint(req: ChatMessageRequest):
+    """Interactive text chat endpoint for a registration job."""
+    job_id = req.job_id
+    if job_id not in explain_sessions:
+        try:
+            summary = build_chatbot_summary(job_id)
+            explain_sessions[job_id] = {
+                "summary": summary,
+                "history": [],
+                "created_at": datetime.now(),
+            }
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail={"error_code": "JOB_NOT_FOUND", "message": f"Job {job_id} not found."})
+
+    session = explain_sessions[job_id]
+    fast = _try_fast_path(req.message, session["summary"])
+    if fast:
+        session["history"].append({"role": "user", "content": req.message})
+        session["history"].append({"role": "assistant", "content": fast})
+        return {"response": fast, "used_fast_path": True, "job_id": job_id}
+
+    chunks = retrieve(req.message, top_k=4)
+    reply, latency_ms = _call_groq_with_rag(req.message, session["summary"], session["history"], format_for_prompt(chunks))
+    session["history"].append({"role": "user", "content": req.message})
+    session["history"].append({"role": "assistant", "content": reply})
+    return {"response": reply, "used_fast_path": False, "latency_ms": latency_ms, "job_id": job_id}
+
+
+@app.get("/chat/{job_id}/history")
+def get_chat_history(job_id: str):
+    """Retrieve chat turn history for a given job session."""
+    session = explain_sessions.get(job_id)
+    if not session:
+        return {"job_id": job_id, "history": []}
+    return {"job_id": job_id, "history": session.get("history", [])}
+
+
+@app.post("/analyze")
+def analyze_endpoint(job_id: str):
+    """Metric-based analysis endpoint conforming to summary schema."""
+    try:
+        return build_chatbot_summary(job_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail={"error_code": "JOB_NOT_FOUND", "message": f"Job {job_id} not found."})
 
