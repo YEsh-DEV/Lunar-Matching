@@ -56,6 +56,7 @@ from core.geometric_verification import (
     fit_thin_plate_spline,
     check_relief_significance,
     compute_homography_residuals,
+    GeometricDegeneracyError,
 )
 from core.subpixel_refiner import refine_all_matches, refine_matches_localized_patches
 from core.validation_split import held_out_rmse
@@ -508,7 +509,37 @@ class LunaMatchPipeline:
             )
             self.stage_timings_ms['verification_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
+        except (GeometricDegeneracyError, np.linalg.LinAlgError) as e_deg:
+            err = f"GEOMETRIC_DEGENERACY: {e_deg}"
+            logger.warning(f"[{self.job_id}] {err}")
+            self._write_status(JobState.FAILED, err)
+            fail_metrics = {
+                'status': 'FAILED',
+                'error_code': 'GEOMETRIC_DEGENERACY',
+                'stage': 'verification',
+                'error': str(e_deg),
+                'is_synthetic_fallback': False,
+            }
+            with open(self.paths['metrics'], 'w') as f:
+                json.dump(fail_metrics, f, indent=2)
+            return fail_metrics
+
         except Exception as e:
+            if "singular matrix" in str(e).lower() or isinstance(e, np.linalg.LinAlgError):
+                err = f"GEOMETRIC_DEGENERACY: {e}"
+                logger.warning(f"[{self.job_id}] {err}")
+                self._write_status(JobState.FAILED, err)
+                fail_metrics = {
+                    'status': 'FAILED',
+                    'error_code': 'GEOMETRIC_DEGENERACY',
+                    'stage': 'verification',
+                    'error': str(e),
+                    'is_synthetic_fallback': False,
+                }
+                with open(self.paths['metrics'], 'w') as f:
+                    json.dump(fail_metrics, f, indent=2)
+                return fail_metrics
+
             err = f"Step 5 (Geometric Verification) failed: {e}"
             logger.error(f"{err}\n{traceback.format_exc()}")
             self._write_status(JobState.FAILED, err)

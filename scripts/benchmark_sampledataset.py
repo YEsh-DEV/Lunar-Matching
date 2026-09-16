@@ -77,8 +77,11 @@ def main():
                 print(f"    Condition No:    {result.get('condition_number')}")
                 print(f"    Elapsed:         {elapsed}s")
             else:
-                print(f"    Stage: {result.get('stage')}")
-                print(f"    Error: {result.get('error')}")
+                print(f"    Stage:      {result.get('stage')}")
+                if result.get('error_code'):
+                    print(f"    Error Code: {result.get('error_code')}")
+                print(f"    Error:      {result.get('error')}")
+                print(f"    Elapsed:    {elapsed}s")
 
         except Exception as e:
             elapsed = round(time.time() - t0, 3)
@@ -133,8 +136,9 @@ def main():
                 f"{res.get('condition_number'):.2f}" if isinstance(res.get('condition_number'), (int, float)) else str(res.get('condition_number')),
             ]
         else:
-            err = res_info.get("error") or res.get("error") or "FAIL"
-            row = [name, status, elapsed_str, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
+            err_code = res.get("error_code")
+            display_status = f"FAILED ({err_code})" if err_code else status
+            row = [name, display_status, elapsed_str, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
         print(f"| {' | '.join(row)} |")
     print("=" * 100)
 

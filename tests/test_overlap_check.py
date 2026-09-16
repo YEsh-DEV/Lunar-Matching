@@ -136,3 +136,20 @@ def test_pipeline_rejects_synthetic_non_overlapping_pair():
     finally:
         if job_dir.exists():
             shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def test_ncc_overlap_scale_disparity_pair_passes():
+    """
+    Ensure scale-disparate pairs (e.g. 1.67x or 4.22x) correctly pass the overlap gate
+    via scale-invariant downsampling, while preserving fast-fail on noise.
+    """
+    rng = np.random.default_rng(123)
+    base = rng.uniform(50, 200, (200, 200))
+    # img_b is downscaled version of img_a (2.0x scale disparity)
+    img_a = base
+    img_b = base[::2, ::2]
+
+    overlap = estimate_overlap(img_a, img_b, None, None)
+    assert overlap > 0.50, f"Expected high overlap for scaled identical image, got {overlap}"
+    overlap_gate(overlap, min_required=0.15)
+

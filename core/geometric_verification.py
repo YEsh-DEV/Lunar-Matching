@@ -32,6 +32,13 @@ except ImportError:
     _HAS_SCIPY = False
 
 
+class GeometricDegeneracyError(ValueError):
+    """Raised when geometric model fitting encounters mathematical degeneracy or singular matrix."""
+    def __init__(self, message: str = "Geometric model fitting failed due to degenerate or singular point configuration"):
+        super().__init__(message)
+        self.error_code = "GEOMETRIC_DEGENERACY"
+
+
 # ---------------------------------------------------------------------------
 # Thin Plate Spline wrapper (interface contract: .apply(points) method)
 # ---------------------------------------------------------------------------
@@ -305,16 +312,21 @@ def fit_thin_plate_spline(
     dst = dst_pts.astype(np.float64)
 
     # Separate RBF for x and y channels
-    rbf_x = RBFInterpolator(
-        src, dst[:, 0],
-        kernel='thin_plate_spline',
-        smoothing=smoothing,
-    )
-    rbf_y = RBFInterpolator(
-        src, dst[:, 1],
-        kernel='thin_plate_spline',
-        smoothing=smoothing,
-    )
+    try:
+        rbf_x = RBFInterpolator(
+            src, dst[:, 0],
+            kernel='thin_plate_spline',
+            smoothing=smoothing,
+        )
+        rbf_y = RBFInterpolator(
+            src, dst[:, 1],
+            kernel='thin_plate_spline',
+            smoothing=smoothing,
+        )
+    except (np.linalg.LinAlgError, ValueError) as e:
+        raise GeometricDegeneracyError(
+            f"TPS fitting failed due to degenerate/singular point configuration: {e}"
+        ) from e
 
     logger.info(
         f"TPS fitted on {len(src_pts)} control points "

@@ -123,30 +123,70 @@ def _ncc_overlap_proxy(
     img_a: np.ndarray,
     img_b: np.ndarray,
     target_dim: int = 64,
+    meta_a: Any = None,
+    meta_b: Any = None,
 ) -> float:
     """
     Downsample both images to target_dim x target_dim and compute normalized
     cross-correlation peak location and magnitude as a coarse overlap proxy.
+    Accounts for scale disparity between images before resizing to target_dim.
     """
+    # 1. Determine scale disparity ratio
+    scale_ratio = 1.0
+    gsd_a = getattr(meta_a, "gsd", None) if meta_a else None
+    gsd_b = getattr(meta_b, "gsd", None) if meta_b else None
+    if gsd_a is not None and gsd_b is not None:
+        try:
+            ga, gb = float(gsd_a), float(gsd_b)
+            if ga > 0 and gb > 0 and abs(ga - gb) > 1e-4:
+                scale_ratio = max(ga, gb) / min(ga, gb)
+        except (ValueError, TypeError):
+            pass
+
+    # If GSD is not differentiating, compute from image dimensions (pixel_dimension_ratio logic)
+    dim_a = max(img_a.shape[:2]) if img_a.ndim >= 2 else 1
+    dim_b = max(img_b.shape[:2]) if img_b.ndim >= 2 else 1
+    pixel_dim_ratio = float(max(dim_a, dim_b) / max(min(dim_a, dim_b), 1))
+
+    if scale_ratio <= 1.05 and pixel_dim_ratio > 1.05:
+        scale_ratio = pixel_dim_ratio
+
+    # Rescale the larger image down to match the smaller image's effective scale before 64x64 resize
+    a_proc = img_a
+    b_proc = img_b
+    if scale_ratio > 1.05:
+        if dim_a > dim_b:
+            scale_factor = float(dim_b) / float(dim_a)
+            new_w = max(16, int(round(img_a.shape[1] * scale_factor)))
+            new_h = max(16, int(round(img_a.shape[0] * scale_factor)))
+            if _HAS_CV2:
+                a_proc = cv2.resize(img_a.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_AREA)
+        elif dim_b > dim_a:
+            scale_factor = float(dim_a) / float(dim_b)
+            new_w = max(16, int(round(img_b.shape[1] * scale_factor)))
+            new_h = max(16, int(round(img_b.shape[0] * scale_factor)))
+            if _HAS_CV2:
+                b_proc = cv2.resize(img_b.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     # Downsample
     if _HAS_CV2:
         a_small = cv2.resize(
-            img_a.astype(np.float32),
+            a_proc.astype(np.float32),
             (target_dim, target_dim),
             interpolation=cv2.INTER_AREA,
         )
         b_small = cv2.resize(
-            img_b.astype(np.float32),
+            b_proc.astype(np.float32),
             (target_dim, target_dim),
             interpolation=cv2.INTER_AREA,
         )
     else:
-        sy_a = max(1, img_a.shape[0] // target_dim)
-        sx_a = max(1, img_a.shape[1] // target_dim)
-        a_small = img_a[::sy_a, ::sx_a][:target_dim, :target_dim].astype(np.float32)
-        sy_b = max(1, img_b.shape[0] // target_dim)
-        sx_b = max(1, img_b.shape[1] // target_dim)
-        b_small = img_b[::sy_b, ::sx_b][:target_dim, :target_dim].astype(np.float32)
+        sy_a = max(1, a_proc.shape[0] // target_dim)
+        sx_a = max(1, a_proc.shape[1] // target_dim)
+        a_small = a_proc[::sy_a, ::sx_a][:target_dim, :target_dim].astype(np.float32)
+        sy_b = max(1, b_proc.shape[0] // target_dim)
+        sx_b = max(1, b_proc.shape[1] // target_dim)
+        b_small = b_proc[::sy_b, ::sx_b][:target_dim, :target_dim].astype(np.float32)
 
     # Normalize to zero mean and unit variance
     mean_a = np.mean(a_small)
@@ -181,16 +221,19 @@ def _ncc_overlap_proxy(
     overlap_h = max(0, target_dim - abs(dy))
     geom_overlap = (overlap_w * overlap_h) / float(target_dim * target_dim)
 
-    # Estimated overlap score weighted by normalized cross-correlation peak magnitude
-    overlap_fraction = geom_overlap * max(0.0, peak_val)
+    # Estimated overlap score:
+    # If peak_val is noise floor (< 0.06), confidence is 0.0.
+    # Between 0.06 and 0.15, smoothly scale confidence to 1.0.
+    conf = float(np.clip((peak_val - 0.06) / (0.15 - 0.06), 0.0, 1.0))
+    overlap_fraction = geom_overlap * conf
     return float(np.clip(overlap_fraction, 0.0, 1.0))
 
 
 def estimate_overlap(
     img_a: np.ndarray,
     img_b: np.ndarray,
-    meta_a: Any,
-    meta_b: Any,
+    meta_a: Any = None,
+    meta_b: Any = None,
 ) -> float:
     """
     Returns estimated overlap fraction [0.0 - 1.0].
@@ -215,7 +258,7 @@ def estimate_overlap(
             return float(iou)
 
     # Fallback to downsampled NCC peak proxy
-    proxy = _ncc_overlap_proxy(img_a, img_b, target_dim=64)
+    proxy = _ncc_overlap_proxy(img_a, img_b, target_dim=64, meta_a=meta_a, meta_b=meta_b)
     logger.info(f"Stage 0: Downsampled NCC overlap proxy = {proxy:.4f}")
     return float(proxy)
 

@@ -9,6 +9,7 @@ import pytest
 from core.geometric_verification import (
     magsac_filter, fit_thin_plate_spline, check_relief_significance,
     compute_homography_residuals, ThinPlateSplineTransform,
+    GeometricDegeneracyError,
 )
 
 try:
@@ -221,5 +222,18 @@ def test_condition_number_fallback_near_collinear():
     assert cond <= 1e4, f"Expected condition number <= 1e4 after fallback; got {cond}"
     assert model is not None
     assert model.shape == (3, 3)
+
+
+def test_tps_singular_matrix_raises_geometric_degeneracy_error():
+    """
+    Ensure collinear/duplicate control points cause fit_thin_plate_spline
+    to raise GeometricDegeneracyError with error_code='GEOMETRIC_DEGENERACY'.
+    """
+    pts_a = np.array([[10.0, 10.0], [10.0, 10.0], [10.0, 10.0], [10.0, 10.0]])
+    pts_b = np.array([[12.0, 12.0], [12.0, 12.0], [12.0, 12.0], [12.0, 12.0]])
+    with pytest.raises(GeometricDegeneracyError) as exc_info:
+        fit_thin_plate_spline(pts_a, pts_b)
+    assert exc_info.value.error_code == "GEOMETRIC_DEGENERACY"
+
 
 
