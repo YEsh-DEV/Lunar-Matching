@@ -239,3 +239,70 @@ def refine_all_matches(
         logger.info(f"LK non-converged sample (first {min(5, len(non_converged_samples))}): {samples_detail}")
 
     return refined
+
+
+def refine_matches_localized_patches(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    matches: np.ndarray,
+    margin: int = 25,
+    patch_size: int = 15,
+    iterations: int = 8,
+    max_shift: float = 1.0,
+) -> np.ndarray:
+    """
+    Refine correspondences by cropping small localized patches from full-resolution
+    imagery around each keypoint, executing Lucas-Kanade refinement on the patches.
+    Avoids processing or storing full-resolution Phase Congruency maps in memory.
+    """
+    if matches.ndim != 2 or matches.shape[1] != 5:
+        raise ValueError(f"matches must be (N, 5); got {matches.shape}")
+
+    def _norm(img):
+        img = img.astype(np.float64)
+        mn, mx = img.min(), img.max()
+        return (img - mn) / (mx - mn) if mx > mn else img
+
+    img_a_n = _norm(img_a)
+    img_b_n = _norm(img_b)
+
+    H_a, W_a = img_a_n.shape[:2]
+    H_b, W_b = img_b_n.shape[:2]
+
+    refined = matches.copy()
+    n_ok = 0
+
+    for i in range(len(matches)):
+        x1, y1, x2, y2, conf = matches[i]
+        x1_i, y1_i = int(round(x1)), int(round(y1))
+        x2_i, y2_i = int(round(x2)), int(round(y2))
+
+        # Check bounds with margin
+        if (x1_i - margin < 0 or x1_i + margin >= W_a or
+            y1_i - margin < 0 or y1_i + margin >= H_a or
+            x2_i - margin < 0 or x2_i + margin >= W_b or
+            y2_i - margin < 0 or y2_i + margin >= H_b):
+            continue
+
+        patch_a = img_a_n[y1_i - margin : y1_i + margin + 1, x1_i - margin : x1_i + margin + 1]
+        patch_b = img_b_n[y2_i - margin : y2_i + margin + 1, x2_i - margin : x2_i + margin + 1]
+
+        local_pt = (
+            margin + (x1 - x1_i),
+            margin + (y1 - y1_i),
+            margin + (x2 - x2_i),
+            margin + (y2 - y2_i),
+        )
+
+        cx, cy, ok = lucas_kanade_refine(
+            patch_a, patch_b, local_pt,
+            patch_size=patch_size, iterations=iterations,
+            max_shift=max_shift,
+        )
+        if ok:
+            refined[i, 2] = (x2_i - margin) + cx
+            refined[i, 3] = (y2_i - margin) + cy
+            n_ok += 1
+
+    logger.info(f"Localized patch LK refinement: {n_ok}/{len(matches)} converged on full-res patches.")
+    return refined

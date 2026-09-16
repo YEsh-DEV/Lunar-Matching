@@ -148,7 +148,7 @@ def _run_classical_matching(
                     m, n = pair
                     if m.distance < 0.80 * n.distance:
                         conf = float(np.clip(1.0 - m.distance / max(n.distance, 1e-6), 0.2, 1.0))
-                        if conf >= confidence_thresh:
+                        if conf >= min(confidence_thresh, 0.2):
                             pt_a = kp_a[m.queryIdx].pt
                             pt_b = kp_b[m.trainIdx].pt
                             matches_list.append([pt_a[0], pt_a[1], pt_b[0], pt_b[1], conf])

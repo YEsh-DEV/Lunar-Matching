@@ -41,6 +41,7 @@ class JobState(Enum):
 
 from core.ingest_preprocess import (
     read_raster,
+    read_raster_overview,
     lommel_seeliger_normalize,
     align_gsd,
     contrast_check,
@@ -55,7 +56,7 @@ from core.geometric_verification import (
     check_relief_significance,
     compute_homography_residuals,
 )
-from core.subpixel_refiner import refine_all_matches
+from core.subpixel_refiner import refine_all_matches, refine_matches_localized_patches
 from core.warp_and_eval import (
     warp_image,
     compute_rmse,
@@ -175,17 +176,41 @@ class LunaMatchPipeline:
             img_b = lommel_seeliger_normalize(img_b, meta_b)
             img_a, img_b = align_gsd(img_a, img_b, meta_a, meta_b)
 
+            # Check if coarse-to-fine overview is needed for large rasters
+            COARSE_MAX_DIM = 640
+            longer_dim = max(max(img_a.shape[:2]), max(img_b.shape[:2]))
+            is_large = longer_dim > COARSE_MAX_DIM
+
+            if is_large:
+                logger.info(f"[{self.job_id}] Coarse-to-fine active: max dimension {longer_dim}px > {COARSE_MAX_DIM}px")
+                img_a_c, meta_a_c = read_raster_overview(self.img_a_path, max_dim=COARSE_MAX_DIM)
+                img_b_c, meta_b_c = read_raster_overview(self.img_b_path, max_dim=COARSE_MAX_DIM)
+                img_a_c = lommel_seeliger_normalize(img_a_c, meta_a_c)
+                img_b_c = lommel_seeliger_normalize(img_b_c, meta_b_c)
+                img_a_c, img_b_c = align_gsd(img_a_c, img_b_c, meta_a_c, meta_b_c)
+
+                scale_a_x = float(img_a.shape[1]) / float(max(img_a_c.shape[1], 1))
+                scale_a_y = float(img_a.shape[0]) / float(max(img_a_c.shape[0], 1))
+                scale_b_x = float(img_b.shape[1]) / float(max(img_b_c.shape[1], 1))
+                scale_b_y = float(img_b.shape[0]) / float(max(img_b_c.shape[0], 1))
+            else:
+                img_a_c, meta_a_c = img_a, meta_a
+                img_b_c, meta_b_c = img_b, meta_b
+                scale_a_x = scale_a_y = scale_b_x = scale_b_y = 1.0
+
             # ---- Stage 0.5: Conditional CLAHE + Unsharp pre-filter ----
             # Only applied when cheap Michelson contrast check flags it.
             # Must NOT degrade already-adequate images.
             t_prefilter = time.perf_counter()
             prefilter_applied_a = False
             prefilter_applied_b = False
-            if contrast_check(img_a):
+            if contrast_check(img_a_c):
+                img_a_c = apply_clahe_unsharp(img_a_c)
                 img_a = apply_clahe_unsharp(img_a)
                 prefilter_applied_a = True
                 logger.info(f"[{self.job_id}] Stage 0.5: Low-contrast img_a detected — CLAHE+unsharp applied")
-            if contrast_check(img_b):
+            if contrast_check(img_b_c):
+                img_b_c = apply_clahe_unsharp(img_b_c)
                 img_b = apply_clahe_unsharp(img_b)
                 prefilter_applied_b = True
                 logger.info(f"[{self.job_id}] Stage 0.5: Low-contrast img_b detected — CLAHE+unsharp applied")
@@ -221,8 +246,8 @@ class LunaMatchPipeline:
         t_start = time.perf_counter()
         try:
             logger.info(f"[{self.job_id}] Step 2: Phase Congruency & MIM (mode={self.mode})")
-            feats_a = extract_structural_features(img_a, mode=self.mode)
-            feats_b = extract_structural_features(img_b, mode=self.mode)
+            feats_a = extract_structural_features(img_a_c, mode=self.mode)
+            feats_b = extract_structural_features(img_b_c, mode=self.mode)
             self._save_npy(self.paths['pc_map_a'], feats_a['pc_map'])
             self._save_npy(self.paths['mim_a'],    feats_a['mim'])
             self._save_npy(self.paths['pc_map_b'], feats_b['pc_map'])
@@ -243,14 +268,20 @@ class LunaMatchPipeline:
         try:
             logger.info(f"[{self.job_id}] Crater Detection: Mining phase congruency edge moment maps")
             import cv2
-            gsd_a = float(meta_a.gsd) if hasattr(meta_a, 'gsd') else float(meta_a.get('gsd', 1.0))
-            gsd_b = float(meta_b.gsd) if hasattr(meta_b, 'gsd') else float(meta_b.get('gsd', 1.0))
+            gsd_a = float(meta_a_c.gsd) if hasattr(meta_a_c, 'gsd') else float(meta_a_c.get('gsd', 1.0))
+            gsd_b = float(meta_b_c.gsd) if hasattr(meta_b_c, 'gsd') else float(meta_b_c.get('gsd', 1.0))
 
             edge_a = feats_a.get('edge_map')
             edge_b = feats_b.get('edge_map')
 
             if edge_a is not None:
                 craters_a = detect_craters(edge_a, gsd_m_per_px=gsd_a)
+                if is_large:
+                    for c in craters_a:
+                        cx, cy = c["center_px"]
+                        c["center_px"] = (round(cx * scale_a_x, 2), round(cy * scale_a_y, 2))
+                        c["radius_px"] = round(c["radius_px"] * scale_a_x, 2)
+                        c["diameter_px"] = round(c["diameter_px"] * scale_a_x, 2)
                 with open(self.paths['craters_a'], 'w') as f:
                     json.dump(craters_a, f, indent=2)
                 overlay_a = render_crater_overlay(img_a, craters_a)
@@ -258,6 +289,12 @@ class LunaMatchPipeline:
 
             if edge_b is not None:
                 craters_b = detect_craters(edge_b, gsd_m_per_px=gsd_b)
+                if is_large:
+                    for c in craters_b:
+                        cx, cy = c["center_px"]
+                        c["center_px"] = (round(cx * scale_b_x, 2), round(cy * scale_b_y, 2))
+                        c["radius_px"] = round(c["radius_px"] * scale_b_x, 2)
+                        c["diameter_px"] = round(c["diameter_px"] * scale_b_x, 2)
                 with open(self.paths['craters_b'], 'w') as f:
                     json.dump(craters_b, f, indent=2)
                 overlay_b = render_crater_overlay(img_b, craters_b)
@@ -278,7 +315,7 @@ class LunaMatchPipeline:
             logger.info(f"[{self.job_id}] Step 3: Dense Matching (method={self.matching_method})")
 
             matches_raw = run_dense_matching(
-                img_a, img_b,
+                img_a_c, img_b_c,
                 method=self.matching_method,
                 feats_a=feats_a,
                 feats_b=feats_b,
@@ -344,17 +381,28 @@ class LunaMatchPipeline:
             self._write_status(JobState.VERIFYING)
             logger.info(f"[{self.job_id}] Step 5: MAGSAC++ & Geometric Verification")
 
-            pts_a = matches_anms[:, :2]
-            pts_b = matches_anms[:, 2:4]
+            # Scale match coordinates from coarse to full resolution if is_large
+            if is_large:
+                matches_full = matches_anms.copy()
+                matches_full[:, 0] *= scale_a_x
+                matches_full[:, 1] *= scale_a_y
+                matches_full[:, 2] *= scale_b_x
+                matches_full[:, 3] *= scale_b_y
+            else:
+                matches_full = matches_anms
 
-            inlier_mask, H_matrix = magsac_filter(pts_a, pts_b)
+            pts_a = matches_full[:, :2]
+            pts_b = matches_full[:, 2:4]
+
+            reproj_thresh = 3.0 * max(scale_a_x, 1.0) if is_large else 3.0
+            inlier_mask, H_matrix = magsac_filter(pts_a, pts_b, reprojection_threshold=reproj_thresh)
 
             if inlier_mask.sum() < 4:
                 raise RuntimeError(
                     f"Too few inliers ({inlier_mask.sum()}) after MAGSAC++."
                 )
 
-            inlier_matches = matches_anms[inlier_mask]
+            inlier_matches = matches_full[inlier_mask]
             self._save_npy(self.paths['matches_verified'], inlier_matches)
 
             # Decide Homography vs TPS
@@ -447,9 +495,16 @@ class LunaMatchPipeline:
             self._write_status(JobState.REFINING)
             logger.info(f"[{self.job_id}] Step 6: Lucas-Kanade Sub-Pixel Refinement")
 
-            pc_a = feats_a['pc_map'] if (feats_a and 'pc_map' in feats_a) else img_a
-            pc_b = feats_b['pc_map'] if (feats_b and 'pc_map' in feats_b) else img_b
-            refined_matches = refine_all_matches(pc_a, pc_b, inlier_matches)
+            if is_large:
+                # Lucas-Kanade refinement only on small localized patches cropped from FULL-resolution image
+                refined_matches = refine_matches_localized_patches(
+                    img_a, img_b, inlier_matches,
+                    margin=25, patch_size=15, max_shift=1.0, iterations=20,
+                )
+            else:
+                pc_a = feats_a['pc_map'] if (feats_a and 'pc_map' in feats_a) else img_a
+                pc_b = feats_b['pc_map'] if (feats_b and 'pc_map' in feats_b) else img_b
+                refined_matches = refine_all_matches(pc_a, pc_b, inlier_matches)
 
             # Re-fit the transform with refined coordinates so Step 7 warping uses sub-pixel accuracy
             pts_a_ref = refined_matches[:, :2]
