@@ -47,6 +47,7 @@ from core.ingest_preprocess import (
     contrast_check,
     apply_clahe_unsharp,
 )
+from core.overlap_check import estimate_overlap, overlap_gate, OverlapTooLowError
 from core.phase_congruency_mim import extract_structural_features
 from core.dense_matcher import run_dense_matching
 from core.anms_spatial_filter import anms_select
@@ -239,6 +240,31 @@ class LunaMatchPipeline:
             logger.error(err)
             self._write_status(JobState.FAILED, err)
             return {'status': 'FAILED', 'stage': 'preprocessing', 'error': str(e)}
+
+        # ----------------------------------------------------------------
+        # STAGE 0 — Footprint Overlap Pre-Check (fast-fail guard)
+        # ----------------------------------------------------------------
+        t_overlap = time.perf_counter()
+        try:
+            overlap_frac = estimate_overlap(img_a_c, img_b_c, meta_a, meta_b)
+            overlap_gate(overlap_frac, min_required=0.15)
+            self.stage_timings_ms['overlap_check_ms'] = round((time.perf_counter() - t_overlap) * 1000, 2)
+            logger.info(f"[{self.job_id}] Stage 0 (Overlap Check) passed: overlap={overlap_frac:.4f}")
+        except OverlapTooLowError as e_overlap:
+            err = f"OVERLAP_TOO_LOW: {e_overlap}"
+            logger.error(f"[{self.job_id}] {err}")
+            self._write_status(JobState.FAILED, err)
+            fail_metrics = {
+                'status': 'FAILED',
+                'error_code': 'OVERLAP_TOO_LOW',
+                'stage': 'overlap_check',
+                'error': str(e_overlap),
+                'overlap_fraction': round(float(overlap_frac), 4) if 'overlap_frac' in locals() else 0.0,
+                'is_synthetic_fallback': False,
+            }
+            with open(self.paths['metrics'], 'w') as f:
+                json.dump(fail_metrics, f, indent=2)
+            return fail_metrics
 
         # ----------------------------------------------------------------
         # STEP 2 — Phase Congruency & MIM
