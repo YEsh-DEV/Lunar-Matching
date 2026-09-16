@@ -62,6 +62,9 @@ from core.validation_split import held_out_rmse
 from core.warp_and_eval import (
     warp_image,
     compute_rmse,
+    compute_mae,
+    compute_ssim,
+    compute_ncc,
     compute_inlier_ratio,
     compute_sdi,
     export_geotiff,
@@ -609,6 +612,9 @@ class LunaMatchPipeline:
             registered = warp_image(img_b, transform, img_a.shape)
 
             rmse         = compute_rmse(refined_matches, registered, img_a, transform=transform)
+            mae          = compute_mae(refined_matches, registered, img_a, transform=transform)
+            ssim         = compute_ssim(registered, img_a)
+            ncc          = compute_ncc(registered, img_a)
             inlier_ratio = compute_inlier_ratio(inlier_mask)
             sdi          = compute_sdi(refined_matches, img_a.shape)
 
@@ -646,6 +652,9 @@ class LunaMatchPipeline:
             metrics = {
                 'status'               : 'DONE',
                 'rmse_px'              : round(float(rmse),         4),
+                'mae_px'               : round(float(mae),          4),
+                'ssim'                 : round(float(ssim),         4),
+                'ncc'                  : round(float(ncc),          4),
                 'held_out_rmse_px'     : final_held_out,
                 'overfit_ratio'        : final_overfit_ratio,
                 'inlier_ratio'         : round(float(inlier_ratio), 4),

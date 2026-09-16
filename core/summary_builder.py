@@ -439,9 +439,13 @@ def build_chatbot_summary(
     metrics = {
         "status": metrics_raw.get("status", status),
         "rmse_px": metrics_raw.get("rmse_px", None),
+        "mae_px": metrics_raw.get("mae_px", None),
+        "ssim": metrics_raw.get("ssim", None),
+        "ncc": metrics_raw.get("ncc", None),
         "inlier_ratio": metrics_raw.get("inlier_ratio", None),
         "sdi": metrics_raw.get("sdi", None),
-        "transform_type": metrics_raw.get("transform", None),
+        "transform_type": metrics_raw.get("transform_type") or metrics_raw.get("transform", None),
+        "condition_number": metrics_raw.get("condition_number", None),
         "n_inliers": metrics_raw.get("n_inliers", 0),
         "n_total": metrics_raw.get("n_total", 0),
         "elapsed_s": metrics_raw.get("elapsed_s", status_info.get("elapsed_s", 0.0)),
@@ -570,9 +574,13 @@ def build_chatbot_summary(
     # Clean numeric metrics for client (remove internal keys)
     client_metrics = {
         "rmse_px": metrics["rmse_px"],
+        "mae_px": metrics.get("mae_px", None),
+        "ssim": metrics.get("ssim", None),
+        "ncc": metrics.get("ncc", None),
         "inlier_ratio": metrics["inlier_ratio"],
         "sdi": metrics["sdi"],
         "transform_type": metrics["transform_type"],
+        "condition_number": metrics.get("condition_number", None),
         "n_inliers": metrics["n_inliers"],
         "n_total": metrics["n_total"],
         "elapsed_s": metrics["elapsed_s"],

@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core.warp_and_eval import (
     warp_image,
     compute_rmse,
+    compute_mae,
+    compute_ncc,
+    compute_ssim,
     compute_inlier_ratio,
     compute_sdi,
     export_geotiff,
@@ -131,3 +134,31 @@ def test_build_metrics_report():
     assert rep['sdi'] == 0.91
     assert rep['n_inliers'] == 150
     assert rep['transform'] == "tps"
+
+
+def test_compute_mae():
+    p1 = np.array([[10.0, 10.0], [20.0, 20.0]])
+    p2 = np.array([[10.0, 13.0], [20.0, 24.0]])  # errors: 3 and 4 -> (3 + 4)/2 = 3.5
+    mae = compute_mae(p1, p2)
+    assert abs(mae - 3.5) < 1e-3
+
+    # Orchestrator 3-arg call
+    matches = np.column_stack([p1, p2, np.ones(len(p1))])
+    mae_3arg = compute_mae(matches, np.zeros((100, 100)), np.zeros((100, 100)))
+    assert abs(mae_3arg - 3.5) < 1e-3
+
+
+def test_compute_ncc_and_ssim():
+    img_ref = np.random.rand(80, 80)
+    # Identical image
+    ncc_same = compute_ncc(img_ref, img_ref)
+    assert abs(ncc_same - 1.0) < 1e-3
+
+    ssim_same = compute_ssim(img_ref, img_ref)
+    assert ssim_same > 0.95
+
+    # Oppositely correlated image
+    img_inv = 1.0 - img_ref
+    ncc_inv = compute_ncc(img_ref, img_inv)
+    assert ncc_inv < 0.0
+

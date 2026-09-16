@@ -189,11 +189,159 @@ def compute_rmse(*args, **kwargs) -> float:
             rmse = float(np.sqrt(np.mean(np.sum(diff**2, axis=1))))
             return round(rmse, 4)
         else:
-            diff = registered - img_a
             rmse = float(np.sqrt(np.mean(diff**2)))
             return round(rmse, 4)
 
     raise ValueError(f"compute_rmse expects 2 or 3 positional arguments; received {len(args)}")
+
+
+def compute_mae(*args, **kwargs) -> float:
+    """
+    Compute Mean Absolute Error (MAE) in pixels.
+    Supports two calling conventions:
+      1) compute_mae(reprojected_pts, reference_pts) -> reprojection MAE in pixels
+      2) compute_mae(refined_matches, registered, img_a, transform=...) -> [Orchestrator format]
+    """
+    transform = kwargs.get('transform', None)
+
+    if len(args) == 2:
+        reprojected_pts, reference_pts = args
+        pts_rep = np.asarray(reprojected_pts, dtype=np.float64)
+        pts_ref = np.asarray(reference_pts, dtype=np.float64)
+        if len(pts_rep) == 0 or len(pts_ref) == 0:
+            return 0.0
+        diff = pts_rep - pts_ref
+        errors = np.sqrt(np.sum(diff**2, axis=1))
+        return round(float(np.mean(errors)), 4)
+
+    if len(args) == 3:
+        refined_matches, registered, img_a = args
+        if isinstance(refined_matches, np.ndarray) and refined_matches.ndim == 2 and refined_matches.shape[1] >= 4 and len(refined_matches) > 0:
+            pts_a = refined_matches[:, :2].astype(np.float64)
+            pts_b = refined_matches[:, 2:4].astype(np.float64)
+
+            if transform is not None:
+                if hasattr(transform, 'apply'):
+                    pts_b_proj = transform.apply(pts_a)
+                elif isinstance(transform, np.ndarray) and transform.shape == (3, 3):
+                    ones = np.ones((len(pts_a), 1), dtype=np.float64)
+                    pts_h = np.hstack([pts_a, ones])
+                    proj = (transform @ pts_h.T).T
+                    w = proj[:, 2:3] + 1e-10
+                    pts_b_proj = proj[:, :2] / w
+                else:
+                    pts_b_proj = pts_a
+                diff = pts_b_proj - pts_b
+            elif len(pts_a) >= 4 and _HAS_CV2:
+                H, _ = cv2.findHomography(pts_a, pts_b, 0)
+                if H is not None:
+                    ones = np.ones((len(pts_a), 1), dtype=np.float64)
+                    pts_h = np.hstack([pts_a, ones])
+                    proj = (H @ pts_h.T).T
+                    w = proj[:, 2:3] + 1e-10
+                    pts_b_proj = proj[:, :2] / w
+                    diff = pts_b_proj - pts_b
+                else:
+                    diff = pts_a - pts_b
+            else:
+                diff = pts_a - pts_b
+
+            errors = np.sqrt(np.sum(diff**2, axis=1))
+            return round(float(np.mean(errors)), 4)
+        else:
+            diff = registered - img_a
+            mae = float(np.mean(np.abs(diff)))
+            return round(mae, 4)
+
+    raise ValueError(f"compute_mae expects 2 or 3 positional arguments; received {len(args)}")
+
+
+def compute_ncc(
+    registered: np.ndarray,
+    reference: np.ndarray,
+    overlap_mask: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Compute Normalized Cross-Correlation (NCC) over the valid overlap region.
+    Returns float in range [-1.0, 1.0].
+    """
+    reg = np.asarray(registered, dtype=np.float64)
+    ref = np.asarray(reference, dtype=np.float64)
+
+    if reg.shape != ref.shape:
+        if _HAS_CV2:
+            reg = cv2.resize(reg, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            h = min(reg.shape[0], ref.shape[0])
+            w = min(reg.shape[1], ref.shape[1])
+            reg = reg[:h, :w]
+            ref = ref[:h, :w]
+
+    if overlap_mask is not None:
+        mask = np.asarray(overlap_mask, dtype=bool)
+    else:
+        # Valid non-zero overlap
+        mask = (reg != 0) | (ref != 0)
+
+    if not np.any(mask):
+        return 0.0
+
+    r_vals = reg[mask]
+    y_vals = ref[mask]
+
+    r_mean = np.mean(r_vals)
+    y_mean = np.mean(y_vals)
+
+    r_diff = r_vals - r_mean
+    y_diff = y_vals - y_mean
+
+    r_std = np.sqrt(np.sum(r_diff ** 2))
+    y_std = np.sqrt(np.sum(y_diff ** 2))
+
+    if r_std < 1e-9 or y_std < 1e-9:
+        return 0.0
+
+    ncc = float(np.sum(r_diff * y_diff) / (r_std * y_std))
+    return round(float(np.clip(ncc, -1.0, 1.0)), 4)
+
+
+def compute_ssim(
+    registered: np.ndarray,
+    reference: np.ndarray,
+    overlap_mask: Optional[np.ndarray] = None,
+) -> float:
+    """
+    Compute Structural Similarity Index (SSIM) over the valid overlap region.
+    Uses skimage.metrics.structural_similarity if available, else a manual NCC fallback.
+    """
+    reg = np.asarray(registered, dtype=np.float64)
+    ref = np.asarray(reference, dtype=np.float64)
+
+    if reg.shape != ref.shape:
+        if _HAS_CV2:
+            reg = cv2.resize(reg, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_LINEAR)
+        else:
+            h = min(reg.shape[0], ref.shape[0])
+            w = min(reg.shape[1], ref.shape[1])
+            reg = reg[:h, :w]
+            ref = ref[:h, :w]
+
+    try:
+        from skimage.metrics import structural_similarity as ssim_fn
+        if overlap_mask is not None and np.any(overlap_mask):
+            ys, xs = np.where(overlap_mask)
+            if len(ys) >= 64:
+                ymin, ymax = ys.min(), ys.max() + 1
+                xmin, xmax = xs.min(), xs.max() + 1
+                reg = reg[ymin:ymax, xmin:xmax]
+                ref = ref[ymin:ymax, xmin:xmax]
+
+        data_range = float(max(ref.max() - ref.min(), 1.0))
+        score = float(ssim_fn(reg, ref, data_range=data_range))
+        return round(score, 4)
+    except Exception:
+        # Fallback to manual NCC
+        return compute_ncc(reg, ref, overlap_mask)
 
 
 def compute_inlier_ratio(*args, **kwargs) -> float:
