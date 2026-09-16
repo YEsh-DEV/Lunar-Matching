@@ -58,6 +58,7 @@ from core.geometric_verification import (
     compute_homography_residuals,
 )
 from core.subpixel_refiner import refine_all_matches, refine_matches_localized_patches
+from core.validation_split import held_out_rmse
 from core.warp_and_eval import (
     warp_image,
     compute_rmse,
@@ -573,6 +574,29 @@ class LunaMatchPipeline:
             return fail_metrics
 
         # ----------------------------------------------------------------
+        # STEP 6b — Held-Out Validation Split (Stage 6b)
+        # ----------------------------------------------------------------
+        t_val = time.perf_counter()
+        held_out_rmse_px = None
+        overfit_ratio = None
+        try:
+            if transform_type == 'tps':
+                fitter = lambda s, d: fit_thin_plate_spline(s, d)
+            else:
+                def fitter(s, d):
+                    import cv2
+                    H, _ = cv2.findHomography(s, d, 0)
+                    return H.astype(np.float64) if H is not None else None
+
+            val_res = held_out_rmse(refined_matches, fitter, split_ratio=0.8, seed=42)
+            held_out_rmse_px = val_res.get('held_out_rmse_px')
+            overfit_ratio = val_res.get('overfit_ratio')
+            self.stage_timings_ms['validation_split_ms'] = round((time.perf_counter() - t_val) * 1000, 2)
+            logger.info(f"[{self.job_id}] Step 6b: Held-out RMSE = {held_out_rmse_px}px, Overfit ratio = {overfit_ratio}")
+        except Exception as e_val:
+            logger.warning(f"Step 6b (Validation Split) skipped: {e_val}")
+
+        # ----------------------------------------------------------------
         # STEP 7 — Warp & Evaluation
         # ----------------------------------------------------------------
         t_start = time.perf_counter()
@@ -613,9 +637,14 @@ class LunaMatchPipeline:
             self.stage_timings_ms['warp_and_eval_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
             self.stage_timings_ms['total_pipeline_ms'] = round((time.time() - self._start_time) * 1000, 1)
 
+            final_held_out = round(float(held_out_rmse_px), 4) if held_out_rmse_px is not None else round(float(rmse), 4)
+            final_overfit_ratio = round(float(overfit_ratio), 4) if overfit_ratio is not None else 1.0
+
             metrics = {
                 'status'               : 'DONE',
                 'rmse_px'              : round(float(rmse),         4),
+                'held_out_rmse_px'     : final_held_out,
+                'overfit_ratio'        : final_overfit_ratio,
                 'inlier_ratio'         : round(float(inlier_ratio), 4),
                 'sdi'                  : round(float(sdi),          4),
                 'n_inliers'            : int(inlier_mask.sum()),
