@@ -262,29 +262,83 @@ def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str, matchi
 
 
 @app.post("/register", response_model=JobStatusResponse, status_code=status.HTTP_202_ACCEPTED)
-def register_images(req: RegisterRequest, background_tasks: BackgroundTasks):
+async def register_images(request: Request, background_tasks: BackgroundTasks):
     """
     Initiate a new registration pipeline run between Chandrayaan-2 moving imagery
-    and reference lunar imagery.
+    and reference lunar imagery. Supports both JSON body and multipart file uploads.
     """
-    job_id = req.job_id or f"job_{uuid.uuid4().hex[:10]}"
+    content_type = request.headers.get("content-type", "")
 
-    if not os.path.exists(req.img_a_path):
-        raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Source image not found: {req.img_a_path}", job_id=job_id)
-    if not os.path.exists(req.img_b_path):
-        raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Reference image not found: {req.img_b_path}", job_id=job_id)
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        job_id = str(form.get("job_id") or f"job_{uuid.uuid4().hex[:10]}")
+        mode = str(form.get("mode") or "standard")
+        matching_method = str(form.get("matching_method") or "classical")
 
-    if req.matching_method.lower() == "loftr":
+        img_a_upload = form.get("img_a")
+        img_b_upload = form.get("img_b")
+
+        if not img_a_upload or not img_b_upload:
+            raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message="Both 'img_a' and 'img_b' files must be uploaded.", job_id=job_id)
+
+        input_dir = Path("data") / "jobs" / job_id / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        filename_a = getattr(img_a_upload, "filename", "img_a.tif") or "img_a.tif"
+        filename_b = getattr(img_b_upload, "filename", "img_b.tif") or "img_b.tif"
+
+        path_a = str(input_dir / filename_a)
+        path_b = str(input_dir / filename_b)
+
+        if hasattr(img_a_upload, "read"):
+            content_a = await img_a_upload.read()
+        elif hasattr(img_a_upload, "file"):
+            content_a = img_a_upload.file.read()
+        else:
+            content_a = bytes(img_a_upload)
+
+        with open(path_a, "wb") as f_a:
+            f_a.write(content_a)
+
+        if hasattr(img_b_upload, "read"):
+            content_b = await img_b_upload.read()
+        elif hasattr(img_b_upload, "file"):
+            content_b = img_b_upload.file.read()
+        else:
+            content_b = bytes(img_b_upload)
+
+        with open(path_b, "wb") as f_b:
+            f_b.write(content_b)
+
+        img_a_path = path_a
+        img_b_path = path_b
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        job_id = body.get("job_id") or f"job_{uuid.uuid4().hex[:10]}"
+        img_a_path = body.get("img_a_path")
+        img_b_path = body.get("img_b_path")
+        matching_method = body.get("matching_method", "classical")
+        mode = body.get("mode", "standard")
+
+        if not img_a_path or not os.path.exists(img_a_path):
+            raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Source image not found: {img_a_path}", job_id=job_id)
+        if not img_b_path or not os.path.exists(img_b_path):
+            raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Reference image not found: {img_b_path}", job_id=job_id)
+
+    if matching_method.lower() == "loftr":
         try:
             _check_loftr_available()
         except LoFTRUnavailableError as e_loftr:
             raise APIError(status_code=400, error_code=ErrorCode.LOFTR_UNAVAILABLE, message=str(e_loftr), job_id=job_id)
 
     # Initialize job directory structure and PENDING status
-    pipeline = LunaMatchPipeline(job_id, req.img_a_path, req.img_b_path, matching_method=req.matching_method, mode=req.mode)
+    pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path, matching_method=matching_method, mode=mode)
 
     # Launch execution asynchronously
-    background_tasks.add_task(_execute_pipeline_task, job_id, req.img_a_path, req.img_b_path, req.matching_method, req.mode)
+    background_tasks.add_task(_execute_pipeline_task, job_id, img_a_path, img_b_path, matching_method, mode)
 
     return JobStatusResponse(
         job_id=job_id,

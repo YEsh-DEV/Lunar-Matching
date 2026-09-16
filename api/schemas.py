@@ -50,10 +50,14 @@ class QualityAssessmentSchema(BaseModel):
 
 class MetricsSchema(BaseModel):
     rmse_px: Optional[float] = None
+    mae_px: Optional[float] = None
+    ssim: Optional[float] = None
+    ncc: Optional[float] = None
     inlier_ratio: Optional[float] = None
     sdi: Optional[float] = None
     transform_type: Optional[str] = None
     transform_readable: Optional[Dict[str, float]] = None
+    condition_number: Optional[float] = None
     n_inliers: int = 0
     n_total: int = 0
     elapsed_s: float = 0.0
