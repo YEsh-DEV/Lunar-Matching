@@ -15,21 +15,24 @@ import os
 import json
 import uuid
 import logging
+import traceback
 from pathlib import Path
 from typing import Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
 from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, SummaryResponse, ChatbotSummaryResponse
+from api.errors import ErrorCode, APIError, api_error_response
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
 from core.warp_and_eval import export_control_points_csv
+from core.dense_matcher import _check_loftr_available, LoFTRUnavailableError
 
 try:
     import rasterio
@@ -54,6 +57,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Structured Error Taxonomy Exception Handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(APIError)
+async def api_error_handler(request: Request, exc: APIError):
+    return api_error_response(exc.status_code, exc.error_code, exc.message, exc.job_id)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    job_id = None
+    path_parts = [p for p in request.url.path.split("/") if p]
+    if "jobs" in path_parts:
+        idx = path_parts.index("jobs")
+        if idx + 1 < len(path_parts) and path_parts[idx + 1] != "register":
+            job_id = path_parts[idx + 1]
+
+    code = ErrorCode.INTERNAL_ERROR
+    msg = str(detail)
+    extra = {}
+    if isinstance(detail, dict):
+        extra = {k: v for k, v in detail.items() if k not in ("error_code", "message", "job_id")}
+        if "error_code" in detail:
+            try:
+                code = ErrorCode(detail["error_code"])
+            except ValueError:
+                code = ErrorCode.INTERNAL_ERROR
+            msg = detail.get("message", msg)
+    elif exc.status_code == 404:
+        code = ErrorCode.JOB_NOT_FOUND
+    elif exc.status_code == 400:
+        if "not found" in msg.lower() or "image" in msg.lower() or "path" in msg.lower():
+            code = ErrorCode.INVALID_INPUT_PATH
+        elif "kind" in msg.lower():
+            code = ErrorCode.INVALID_KIND
+        elif "completed" in msg.lower() or "not done" in msg.lower():
+            code = ErrorCode.JOB_NOT_DONE
+        elif "loftr" in msg.lower():
+            code = ErrorCode.LOFTR_UNAVAILABLE
+        else:
+            code = ErrorCode.INTERNAL_ERROR
+
+    content = {
+        "error_code": code.value if isinstance(code, ErrorCode) else str(code),
+        "message": msg,
+        "job_id": job_id,
+        **extra,
+    }
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(f"INTERNAL_ERROR on {request.url.path}: {exc}\n{traceback.format_exc()}")
+    job_id = None
+    path_parts = [p for p in request.url.path.split("/") if p]
+    if "jobs" in path_parts:
+        idx = path_parts.index("jobs")
+        if idx + 1 < len(path_parts):
+            job_id = path_parts[idx + 1]
+    return api_error_response(500, ErrorCode.INTERNAL_ERROR, str(exc), job_id)
+
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -163,14 +231,14 @@ def health_check():
     }
 
 
-def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str):
+def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str, matching_method: str = "classical", mode: str = "standard"):
     """Background runner for LunaMatchPipeline."""
     try:
-        pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path)
+        pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path, matching_method=matching_method, mode=mode)
         result = pipeline.run()
         logger.info(f"Job {job_id} finished with status: {result.get('status')}")
     except Exception as e:
-        logger.error(f"Execution error for job {job_id}: {e}")
+        logger.error(f"Execution error for job {job_id}: {e}\n{traceback.format_exc()}")
 
 
 @app.post("/register", response_model=JobStatusResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -182,15 +250,21 @@ def register_images(req: RegisterRequest, background_tasks: BackgroundTasks):
     job_id = req.job_id or f"job_{uuid.uuid4().hex[:10]}"
 
     if not os.path.exists(req.img_a_path):
-        raise HTTPException(status_code=400, detail=f"Source image not found: {req.img_a_path}")
+        raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Source image not found: {req.img_a_path}", job_id=job_id)
     if not os.path.exists(req.img_b_path):
-        raise HTTPException(status_code=400, detail=f"Reference image not found: {req.img_b_path}")
+        raise APIError(status_code=400, error_code=ErrorCode.INVALID_INPUT_PATH, message=f"Reference image not found: {req.img_b_path}", job_id=job_id)
+
+    if req.matching_method.lower() == "loftr":
+        try:
+            _check_loftr_available()
+        except LoFTRUnavailableError as e_loftr:
+            raise APIError(status_code=400, error_code=ErrorCode.LOFTR_UNAVAILABLE, message=str(e_loftr), job_id=job_id)
 
     # Initialize job directory structure and PENDING status
-    pipeline = LunaMatchPipeline(job_id, req.img_a_path, req.img_b_path)
+    pipeline = LunaMatchPipeline(job_id, req.img_a_path, req.img_b_path, matching_method=req.matching_method, mode=req.mode)
 
     # Launch execution asynchronously
-    background_tasks.add_task(_execute_pipeline_task, job_id, req.img_a_path, req.img_b_path)
+    background_tasks.add_task(_execute_pipeline_task, job_id, req.img_a_path, req.img_b_path, req.matching_method, req.mode)
 
     return JobStatusResponse(
         job_id=job_id,
@@ -204,7 +278,7 @@ def get_job_status(job_id: str):
     """Query current execution state and elapsed runtime of a registration job."""
     status_file = Path("data") / "jobs" / job_id / "status.json"
     if not status_file.exists():
-        raise HTTPException(status_code=404, detail=f"Job ID not found: {job_id}")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Job ID not found: {job_id}", job_id=job_id)
 
     try:
         with open(status_file, "r") as f:
@@ -216,7 +290,7 @@ def get_job_status(job_id: str):
             error=data.get("error", None),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse job status: {e}")
+        raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to parse job status: {e}", job_id=job_id)
 
 
 @app.get("/jobs/{job_id}/result", response_model=JobResultResponse)
@@ -227,7 +301,7 @@ def get_job_result(job_id: str):
     metrics_file = job_dir / "output" / "metrics.json"
 
     if not status_file.exists():
-        raise HTTPException(status_code=404, detail=f"Job ID not found: {job_id}")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Job ID not found: {job_id}", job_id=job_id)
 
     with open(status_file, "r") as f:
         status_data = json.load(f)
@@ -268,10 +342,11 @@ def get_job_result(job_id: str):
             n_total=metrics.get("n_total"),
             elapsed_s=metrics.get("elapsed_s"),
             transform=metrics.get("transform"),
+            transform_readable=metrics.get("transform_readable"),
             output_files=output_files,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading metrics: {e}")
+        raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Error reading metrics: {e}", job_id=job_id)
 
 
 @app.get("/jobs/{job_id}/summary", response_model=SummaryResponse)
@@ -285,10 +360,10 @@ def get_job_summary(job_id: str):
         summary = build_chatbot_summary(job_id)
         return summary
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Job not found: {job_id}", job_id=job_id)
     except Exception as e:
-        logger.error(f"Failed to build summary for {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
+        logger.error(f"Failed to build summary for {job_id}: {e}\n{traceback.format_exc()}")
+        raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to generate summary: {e}", job_id=job_id)
 
 
 @app.get("/jobs/{job_id}/export")
@@ -299,7 +374,7 @@ def export_job_data(job_id: str, kind: str = "control_points"):
     """
     job_dir = Path("data") / "jobs" / job_id
     if not job_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Job not found: {job_id}", job_id=job_id)
 
     if kind == "control_points":
         csv_path = job_dir / "output" / "control_points.csv"
@@ -313,9 +388,9 @@ def export_job_data(job_id: str, kind: str = "control_points"):
                     matches = np.load(matches_file)
                     export_control_points_csv(matches, csv_path)
                 except Exception as e_exp:
-                    raise HTTPException(status_code=500, detail=f"Failed to generate control points CSV: {e_exp}")
+                    raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to generate control points CSV: {e_exp}", job_id=job_id)
             else:
-                raise HTTPException(status_code=404, detail="No control points found for this job")
+                raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message="No control points found for this job", job_id=job_id)
 
         return FileResponse(
             str(csv_path),
@@ -323,9 +398,11 @@ def export_job_data(job_id: str, kind: str = "control_points"):
             filename=f"{job_id}_control_points.csv",
         )
 
-    raise HTTPException(
+    raise APIError(
         status_code=400,
-        detail=f"Unsupported export kind: '{kind}'. Supported kinds: ['control_points']",
+        error_code=ErrorCode.INVALID_KIND,
+        message=f"Unsupported export kind: '{kind}'. Supported kinds: ['control_points']",
+        job_id=job_id,
     )
 
 
@@ -340,7 +417,11 @@ def get_job_preview(job_id: str, kind: str = "registered"):
     """
     job_dir = Path("data") / "jobs" / job_id
     if not job_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Job not found: {job_id}", job_id=job_id)
+
+    valid_kinds = ("registered", "residual", "checkerboard", "tiepoints", "craters")
+    if kind not in valid_kinds:
+        raise APIError(status_code=400, error_code=ErrorCode.INVALID_KIND, message=f"Unsupported preview kind: '{kind}'. Supported kinds: {list(valid_kinds)}", job_id=job_id)
 
     # Check job completion for derived overlays
     status_file = job_dir / "status.json"
@@ -356,11 +437,11 @@ def get_job_preview(job_id: str, kind: str = "registered"):
         preview_path = job_dir / "output" / "residual_map.png"
         if preview_path.exists():
             return FileResponse(str(preview_path), media_type="image/png")
-        raise HTTPException(status_code=404, detail="Residual map preview not yet generated.")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message="Residual map preview not yet generated.", job_id=job_id)
 
     elif kind == "checkerboard":
         if job_status != JobState.DONE.value:
-            raise HTTPException(status_code=400, detail=f"Job is not completed (current status: {job_status})")
+            raise APIError(status_code=400, error_code=ErrorCode.JOB_NOT_DONE, message=f"Job is not completed (current status: {job_status})", job_id=job_id)
 
         cb_cache_path = job_dir / "output" / "preview_checkerboard.png"
         if cb_cache_path.exists():
@@ -368,15 +449,13 @@ def get_job_preview(job_id: str, kind: str = "registered"):
 
         path_a, _ = _find_job_inputs(job_dir)
         if not path_a or not os.path.exists(path_a):
-            raise HTTPException(status_code=404, detail="Source image input path not recorded or found for checkerboard.")
+            raise APIError(status_code=404, error_code=ErrorCode.INVALID_INPUT_PATH, message="Source image input path not recorded or found for checkerboard.", job_id=job_id)
 
-        # Load raw_a
         try:
             raw_a, _ = read_raster(path_a)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read source image: {e}")
+            raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to read source image: {e}", job_id=job_id)
 
-        # Load registered image
         registered_path = job_dir / "output" / "registered.tif"
         if registered_path.exists() and _HAS_RASTERIO:
             with rasterio.open(str(registered_path)) as s:
@@ -384,7 +463,7 @@ def get_job_preview(job_id: str, kind: str = "registered"):
         elif (job_dir / "output" / "registered.npy").exists():
             registered_img = np.load(str(job_dir / "output" / "registered.npy"))
         else:
-            raise HTTPException(status_code=404, detail="Registered output raster not found.")
+            raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message="Registered output raster not found.", job_id=job_id)
 
         checkerboard = create_checkerboard(raw_a, registered_img, tile_size=36)
         cb_u8 = (np.clip(checkerboard, 0, 1) * 255.0).astype(np.uint8)
@@ -393,7 +472,7 @@ def get_job_preview(job_id: str, kind: str = "registered"):
 
     elif kind == "tiepoints":
         if job_status != JobState.DONE.value:
-            raise HTTPException(status_code=400, detail=f"Job is not completed (current status: {job_status})")
+            raise APIError(status_code=400, error_code=ErrorCode.JOB_NOT_DONE, message=f"Job is not completed (current status: {job_status})", job_id=job_id)
 
         tp_cache_path = job_dir / "output" / "preview_tiepoints.png"
         if tp_cache_path.exists():
@@ -401,20 +480,20 @@ def get_job_preview(job_id: str, kind: str = "registered"):
 
         path_a, path_b = _find_job_inputs(job_dir)
         if not path_a or not path_b or not os.path.exists(path_a) or not os.path.exists(path_b):
-            raise HTTPException(status_code=404, detail="Input images not recorded or found on disk.")
+            raise APIError(status_code=404, error_code=ErrorCode.INVALID_INPUT_PATH, message="Input images not recorded or found on disk.", job_id=job_id)
 
         matches_path = job_dir / "intermediate" / "matches_verified.npy"
         if not matches_path.exists():
             matches_path = job_dir / "intermediate" / "matches_raw.npy"
         if not matches_path.exists():
-            raise HTTPException(status_code=404, detail="Match correspondences not found.")
+            raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message="Match correspondences not found.", job_id=job_id)
 
         try:
             raw_a, _ = read_raster(path_a)
             raw_b, _ = read_raster(path_b)
             matches = np.load(str(matches_path))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read data for tie-points overlay: {e}")
+            raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to read data for tie-points overlay: {e}", job_id=job_id)
 
         tp_canvas = draw_tie_points(raw_a, raw_b, matches)
         cv2.imwrite(str(tp_cache_path), tp_canvas)
@@ -440,9 +519,9 @@ def get_job_preview(job_id: str, kind: str = "registered"):
                 cv2.imwrite(str(crater_cache_path), canvas)
                 return FileResponse(str(crater_cache_path), media_type="image/png")
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to generate crater preview: {e}")
+                raise APIError(status_code=500, error_code=ErrorCode.INTERNAL_ERROR, message=f"Failed to generate crater preview: {e}", job_id=job_id)
 
-        raise HTTPException(status_code=404, detail="Crater overlay preview not found or not yet generated.")
+        raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message="Crater overlay preview not found or not yet generated.", job_id=job_id)
 
     # Default: registered output
     tif_path = job_dir / "output" / "registered.tif"
@@ -453,7 +532,7 @@ def get_job_preview(job_id: str, kind: str = "registered"):
     if npy_path.exists():
         return FileResponse(str(npy_path), media_type="application/octet-stream")
 
-    raise HTTPException(status_code=404, detail=f"Preview kind '{kind}' not found or output missing.")
+    raise APIError(status_code=404, error_code=ErrorCode.JOB_NOT_FOUND, message=f"Preview kind '{kind}' not found or output missing.", job_id=job_id)
 
 
 # ---------------------------------------------------------------------------

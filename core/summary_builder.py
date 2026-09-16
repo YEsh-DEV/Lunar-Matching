@@ -445,6 +445,7 @@ def build_chatbot_summary(
         "inlier_ratio": metrics_raw.get("inlier_ratio", None),
         "sdi": metrics_raw.get("sdi", None),
         "transform_type": metrics_raw.get("transform_type") or metrics_raw.get("transform", None),
+        "transform_readable": metrics_raw.get("transform_readable", None),
         "condition_number": metrics_raw.get("condition_number", None),
         "n_inliers": metrics_raw.get("n_inliers", 0),
         "n_total": metrics_raw.get("n_total", 0),

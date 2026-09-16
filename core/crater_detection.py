@@ -156,9 +156,9 @@ def detect_craters(
         cnt_area = cv2.contourArea(cnt)
         ell_area = math.pi * (d_maj / 2.0) * (d_min / 2.0)
         area_ratio = min(cnt_area, ell_area) / max(cnt_area, ell_area, 1e-4)
-        mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.drawContours(mask, [cnt], -1, 255, 1)
-        mean_edge = float(np.mean(norm_edge[mask > 0])) / 255.0
+        px = np.clip(cnt[:, 0, 0], 0, W - 1)
+        py = np.clip(cnt[:, 0, 1], 0, H - 1)
+        mean_edge = float(np.mean(norm_edge[py, px])) / 255.0
         conf = float(np.clip(0.45 * area_ratio + 0.35 * mean_edge + 0.20 * ar, 0.05, 0.99))
 
         if conf >= confidence_thresh:

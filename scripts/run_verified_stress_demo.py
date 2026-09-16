@@ -21,12 +21,12 @@ sys.path.insert(0, str(root_dir))
 from pipeline.orchestrator import LunaMatchPipeline
 import subprocess
 
-def run_pair(name, img_a, img_b, job_id, out_copy_dir=None):
+def run_pair(name, img_a, img_b, job_id, out_copy_dir=None, mode="fast"):
     print("=" * 80)
-    print(f" RUNNING {name.upper()}: {img_a.name} vs {img_b.name}")
+    print(f" RUNNING {name.upper()}: {img_a.name} vs {img_b.name} (mode={mode})")
     print("=" * 80)
     t0 = time.time()
-    pipeline = LunaMatchPipeline(job_id, str(img_a), str(img_b))
+    pipeline = LunaMatchPipeline(job_id, str(img_a), str(img_b), mode=mode)
     result = pipeline.run()
     elapsed = round(time.time() - t0, 3)
     result["elapsed_s"] = elapsed
@@ -66,6 +66,12 @@ def run_pair(name, img_a, img_b, job_id, out_copy_dir=None):
     return result, pipeline
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run verified and stress demo pairs")
+    parser.add_argument("--mode", choices=["fast", "standard"], default="fast", help="Performance tier (fast or standard)")
+    args = parser.parse_args()
+    mode = args.mode
+
     samples_dir = root_dir / "data" / "samples"
     demo_out = root_dir / "demo_output"
 
@@ -76,7 +82,8 @@ def main():
         "Verified Ground-Truth Pair",
         ver_a, ver_b,
         "verified_pair",
-        out_copy_dir=demo_out / "verified_pair"
+        out_copy_dir=demo_out / "verified_pair",
+        mode=mode
     )
 
     # Run check_against_ground_truth.py
@@ -102,7 +109,8 @@ def main():
         "Illumination Stress Pair",
         stress_a, stress_b,
         "stress_run",
-        out_copy_dir=demo_out / "stress_run"
+        out_copy_dir=demo_out / "stress_run",
+        mode=mode
     )
 
 if __name__ == "__main__":

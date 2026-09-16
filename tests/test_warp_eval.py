@@ -162,3 +162,79 @@ def test_compute_ncc_and_ssim():
     ncc_inv = compute_ncc(img_ref, img_inv)
     assert ncc_inv < 0.0
 
+
+def test_decompose_transform_readable():
+    """
+    Priority 4: decompose_transform_readable returns {rotation_deg, scale, tx, ty}.
+    Verify on translation, rotation, scale, and degenerate/None input.
+    """
+    from core.geometric_verification import decompose_transform_readable
+
+    # 1. Identity transform
+    H_eye = np.eye(3, dtype=np.float64)
+    d_eye = decompose_transform_readable(H_eye)
+    assert d_eye["scale"] == 1.0
+    assert d_eye["rotation_deg"] == 0.0
+    assert d_eye["tx"] == 0.0
+    assert d_eye["ty"] == 0.0
+
+    # 2. Pure translation
+    H_trans = np.array([
+        [1.0, 0.0, 15.5],
+        [0.0, 1.0, -8.2],
+        [0.0, 0.0, 1.0],
+    ])
+    d_trans = decompose_transform_readable(H_trans)
+    assert d_trans["scale"] == 1.0
+    assert d_trans["rotation_deg"] == 0.0
+    assert d_trans["tx"] == 15.5
+    assert d_trans["ty"] == -8.2
+
+    # 3. Pure 90 deg rotation with scale 2.0
+    theta = np.radians(90.0)
+    c, s = np.cos(theta), np.sin(theta)
+    H_rot = np.array([
+        [2.0 * c, -2.0 * s, 10.0],
+        [2.0 * s,  2.0 * c, 20.0],
+        [0.0,     0.0,     1.0],
+    ])
+    d_rot = decompose_transform_readable(H_rot)
+    assert abs(d_rot["scale"] - 2.0) < 1e-3
+    assert abs(d_rot["rotation_deg"] - 90.0) < 1e-3
+    assert abs(d_rot["tx"] - 10.0) < 1e-3
+    assert abs(d_rot["ty"] - 20.0) < 1e-3
+
+    # 4. None / invalid input
+    d_none = decompose_transform_readable(None)
+    assert d_none == {"rotation_deg": 0.0, "scale": 1.0, "tx": 0.0, "ty": 0.0}
+
+
+def test_export_geotiff_uses_reference_georeference_direction_regression():
+    """
+    Priority 4 regression test: export_geotiff MUST use the REFERENCE image's
+    georeference metadata, because the moving image is warped into the reference frame.
+    """
+    import tempfile
+    import rasterio
+    from rasterio.transform import from_origin
+
+    warped = np.ones((64, 64), dtype=np.float32) * 0.5
+    ref_crs = "EPSG:32630"
+    ref_transform = from_origin(500000.0, 4000000.0, 0.5, 0.5)
+    meta_ref = {"crs": ref_crs, "transform": ref_transform, "gsd": 0.5}
+
+    with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as f:
+        out_path = f.name
+
+    try:
+        export_geotiff(warped, out_path, meta_ref)
+        if rasterio is not None and os.path.exists(out_path):
+            with rasterio.open(out_path) as ds:
+                assert ds.crs.to_string() == ref_crs
+                assert ds.transform[0] == ref_transform[0]
+                assert ds.transform[3] == ref_transform[3]
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+

@@ -419,3 +419,60 @@ def compute_homography_residuals(
 
     residuals = np.linalg.norm(proj_eucl - pts_b, axis=1)
     return residuals
+
+
+def decompose_transform_readable(H: np.ndarray) -> dict:
+    """
+    Returns {rotation_deg, scale, tx, ty} decomposed from a similarity/affine
+    approximation of H, for human-readable display — never shown as a raw 3x3
+    matrix to an end consumer without this decomposition alongside it.
+
+    Parameters
+    ----------
+    H : (3, 3) or (2, 3) transformation matrix
+
+    Returns
+    -------
+    dict with keys:
+      - rotation_deg : rotation angle in degrees [-180, 180]
+      - scale        : isotropic/mean scale factor
+      - tx           : translation in x (pixels)
+      - ty           : translation in y (pixels)
+    """
+    if H is None:
+        return {"rotation_deg": 0.0, "scale": 1.0, "tx": 0.0, "ty": 0.0}
+
+    mat = np.asarray(H, dtype=np.float64)
+    if mat.shape == (3, 3):
+        if abs(mat[2, 2]) > 1e-12:
+            mat = mat / mat[2, 2]
+        a = mat[0, 0]
+        b = mat[0, 1]
+        c = mat[1, 0]
+        d = mat[1, 1]
+        tx = mat[0, 2]
+        ty = mat[1, 2]
+    elif mat.shape == (2, 3):
+        a = mat[0, 0]
+        b = mat[0, 1]
+        c = mat[1, 0]
+        d = mat[1, 1]
+        tx = mat[0, 2]
+        ty = mat[1, 2]
+    else:
+        return {"rotation_deg": 0.0, "scale": 1.0, "tx": 0.0, "ty": 0.0}
+
+    s_x = np.sqrt(a * a + c * c)
+    s_y = np.sqrt(b * b + d * d)
+    scale = 0.5 * (s_x + s_y)
+
+    rotation_rad = np.arctan2(c - b, a + d) if (abs(a + d) > 1e-12 or abs(c - b) > 1e-12) else np.arctan2(c, a)
+    rotation_deg = float(np.degrees(rotation_rad))
+
+    return {
+        "rotation_deg": round(float(rotation_deg), 3),
+        "scale": round(float(scale), 4),
+        "tx": round(float(tx), 3),
+        "ty": round(float(ty), 3),
+    }
+

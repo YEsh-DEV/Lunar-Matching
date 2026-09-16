@@ -17,12 +17,15 @@ import logging
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_io_executor = ThreadPoolExecutor(max_workers=2)
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +52,19 @@ from core.ingest_preprocess import (
 )
 from core.overlap_check import estimate_overlap, overlap_gate, OverlapTooLowError
 from core.phase_congruency_mim import extract_structural_features
-from core.dense_matcher import run_dense_matching
+from core.dense_matcher import run_dense_matching, LoFTRUnavailableError
 from core.anms_spatial_filter import anms_select
 from core.geometric_verification import (
     magsac_filter,
     fit_thin_plate_spline,
     check_relief_significance,
     compute_homography_residuals,
+    decompose_transform_readable,
     GeometricDegeneracyError,
 )
 from core.subpixel_refiner import refine_all_matches, refine_matches_localized_patches
 from core.validation_split import held_out_rmse
+from api.errors import ErrorCode
 from core.warp_and_eval import (
     warp_image,
     compute_rmse,
@@ -168,6 +173,7 @@ class LunaMatchPipeline:
         craters_a = []
         craters_b = []
         self.stage_timings_ms = {}
+        _bg_futures = []
 
         # ----------------------------------------------------------------
         # STEP 1 — Ingestion & Preprocessing
@@ -184,8 +190,9 @@ class LunaMatchPipeline:
             img_b = lommel_seeliger_normalize(img_b, meta_b)
             img_a, img_b = align_gsd(img_a, img_b, meta_a, meta_b)
 
-            # Check if coarse-to-fine overview is needed for large rasters
-            COARSE_MAX_DIM = 640
+            # Check if coarse-to-fine overview is needed
+            # In mode="fast", max_dim 400 ensures standard 512px pairs also benefit broadly
+            COARSE_MAX_DIM = 400 if self.mode == "fast" else 480
             longer_dim = max(max(img_a.shape[:2]), max(img_b.shape[:2]))
             is_large = longer_dim > COARSE_MAX_DIM
 
@@ -318,7 +325,7 @@ class LunaMatchPipeline:
                 with open(self.paths['craters_a'], 'w') as f:
                     json.dump(craters_a, f, indent=2)
                 overlay_a = render_crater_overlay(img_a, craters_a)
-                cv2.imwrite(str(self.paths['craters_overlay_a']), overlay_a)
+                _bg_futures.append(_io_executor.submit(cv2.imwrite, str(self.paths['craters_overlay_a']), overlay_a, [cv2.IMWRITE_PNG_COMPRESSION, 1]))
 
             if edge_b is not None:
                 craters_b = detect_craters(edge_b, gsd_m_per_px=gsd_b)
@@ -331,7 +338,7 @@ class LunaMatchPipeline:
                 with open(self.paths['craters_b'], 'w') as f:
                     json.dump(craters_b, f, indent=2)
                 overlay_b = render_crater_overlay(img_b, craters_b)
-                cv2.imwrite(str(self.paths['craters_overlay_b']), overlay_b)
+                _bg_futures.append(_io_executor.submit(cv2.imwrite, str(self.paths['craters_overlay_b']), overlay_b, [cv2.IMWRITE_PNG_COMPRESSION, 1]))
 
             logger.info(f"  Crater detection complete: {len(craters_a)} craters in A, {len(craters_b)} craters in B")
         except Exception as e_crater:
@@ -366,12 +373,29 @@ class LunaMatchPipeline:
             logger.info(f"  {len(matches_raw)} raw candidates")
             self.stage_timings_ms['dense_matching_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
 
+        except LoFTRUnavailableError as e_loftr:
+            err = f"LOFTR_UNAVAILABLE: {e_loftr}"
+            logger.error(f"[{self.job_id}] {err}")
+            self._write_status(JobState.FAILED, err)
+            fail_metrics = {
+                'status': 'FAILED',
+                'error_code': ErrorCode.LOFTR_UNAVAILABLE.value,
+                'stage': 'matching',
+                'error': str(e_loftr),
+                'is_synthetic_fallback': False,
+            }
+            with open(self.paths['metrics'], 'w') as f:
+                json.dump(fail_metrics, f, indent=2)
+            return fail_metrics
+
         except Exception as e:
             err = f"Step 3 (Dense Matching) failed: {e}"
             logger.error(f"{err}\n{traceback.format_exc()}")
             self._write_status(JobState.FAILED, err)
+            err_code = ErrorCode.INSUFFICIENT_MATCHES.value if "insufficient" in str(e).lower() else ErrorCode.INTERNAL_ERROR.value
             fail_metrics = {
                 'status': 'FAILED',
+                'error_code': err_code,
                 'stage': 'matching',
                 'error': str(e),
                 'is_synthetic_fallback': False,
@@ -440,15 +464,22 @@ class LunaMatchPipeline:
             inlier_matches = matches_full[inlier_mask]
             self._save_npy(self.paths['matches_verified'], inlier_matches)
 
-            # Decide Homography vs TPS
+            # Stage 5 decision order:
+            # MAGSAC++ homography -> condition-number check ->
+            # (if ill-conditioned) affine/similarity fallback ->
+            # (if well-conditioned) relief check -> (if significant) TPS refit.
             use_tps = False
-            if H_matrix is not None:
+            if fitted_type == 'homography' and H_matrix is not None:
                 residuals = compute_homography_residuals(
                     pts_a[inlier_mask], pts_b[inlier_mask], H_matrix
                 )
-                use_tps = check_relief_significance(
-                    pts_a[inlier_mask], residuals
-                )
+                if self.mode == "fast":
+                    # In fast mode, skip relief check unless residuals clearly warrant it
+                    mean_res = float(np.mean(residuals)) if len(residuals) > 0 else 0.0
+                    if mean_res > 4.0:
+                        use_tps = check_relief_significance(pts_a[inlier_mask], residuals)
+                else:
+                    use_tps = check_relief_significance(pts_a[inlier_mask], residuals)
 
             if use_tps:
                 logger.info("  Relief parallax detected — fitting Thin Plate Spline")
@@ -475,19 +506,27 @@ class LunaMatchPipeline:
                     )
 
                 t_tps_start = time.perf_counter()
-                transform = fit_thin_plate_spline(tps_src, tps_dst)
-                tps_fit_ms = round((time.perf_counter() - t_tps_start) * 1000, 1)
-                self.stage_timings_ms['tps_fit_ms'] = tps_fit_ms
-                self.stage_timings_ms['tps_n_ctrl_pts'] = len(tps_src)
-                logger.info(
-                    f"  TPS fit: {len(tps_src)} ctrl pts, "
-                    f"fit_time={tps_fit_ms}ms"
-                )
-                transform_type = 'tps'
+                try:
+                    transform = fit_thin_plate_spline(tps_src, tps_dst)
+                    tps_fit_ms = round((time.perf_counter() - t_tps_start) * 1000, 1)
+                    self.stage_timings_ms['tps_fit_ms'] = tps_fit_ms
+                    self.stage_timings_ms['tps_n_ctrl_pts'] = len(tps_src)
+                    logger.info(
+                        f"  TPS fit: {len(tps_src)} ctrl pts, "
+                        f"fit_time={tps_fit_ms}ms"
+                    )
+                    transform_type = 'tps'
+                except Exception as e_tps:
+                    logger.warning(f"  TPS refit failed ({e_tps}); falling back to homography.")
+                    transform = H_matrix
+                    transform_type = 'homography'
 
             else:
                 transform      = H_matrix
                 transform_type = fitted_type
+
+            # Decompose transform for human-readable display and API consumers
+            transform_readable = decompose_transform_readable(H_matrix) if H_matrix is not None else None
 
             # Serialize transform parameters to JSON for cross-agent use
             transform_info = {
@@ -496,6 +535,7 @@ class LunaMatchPipeline:
                 'n_inliers'        : int(inlier_mask.sum()),
                 'n_candidates'     : int(len(matches_anms)),
                 'inlier_ratio'     : float(inlier_mask.mean()),
+                'transform_readable': transform_readable,
             }
             if H_matrix is not None:
                 transform_info['homography'] = H_matrix.tolist()
@@ -515,7 +555,7 @@ class LunaMatchPipeline:
             self._write_status(JobState.FAILED, err)
             fail_metrics = {
                 'status': 'FAILED',
-                'error_code': 'GEOMETRIC_DEGENERACY',
+                'error_code': ErrorCode.GEOMETRIC_DEGENERACY.value,
                 'stage': 'verification',
                 'error': str(e_deg),
                 'is_synthetic_fallback': False,
@@ -531,7 +571,7 @@ class LunaMatchPipeline:
                 self._write_status(JobState.FAILED, err)
                 fail_metrics = {
                     'status': 'FAILED',
-                    'error_code': 'GEOMETRIC_DEGENERACY',
+                    'error_code': ErrorCode.GEOMETRIC_DEGENERACY.value,
                     'stage': 'verification',
                     'error': str(e),
                     'is_synthetic_fallback': False,
@@ -543,8 +583,14 @@ class LunaMatchPipeline:
             err = f"Step 5 (Geometric Verification) failed: {e}"
             logger.error(f"{err}\n{traceback.format_exc()}")
             self._write_status(JobState.FAILED, err)
+            err_code = (
+                ErrorCode.ILL_CONDITIONED_UNRECOVERABLE.value if "ill-conditioned" in str(e).lower()
+                else ErrorCode.GEOMETRIC_DEGENERACY.value if ("inlier" in str(e).lower() or "degenerate" in str(e).lower())
+                else ErrorCode.INTERNAL_ERROR.value
+            )
             fail_metrics = {
                 'status': 'FAILED',
+                'error_code': err_code,
                 'stage': 'verification',
                 'error': str(e),
                 'is_synthetic_fallback': False,
@@ -678,7 +724,7 @@ class LunaMatchPipeline:
                 res_norm = np.clip(res_map / res_max, 0, 1)
                 res_u8 = (res_norm * 255).astype(np.uint8)
                 res_color = cv2.applyColorMap(res_u8, cv2.COLORMAP_JET)
-                cv2.imwrite(str(self.paths['residual_map']), res_color)
+                cv2.imwrite(str(self.paths['residual_map']), res_color, [cv2.IMWRITE_PNG_COMPRESSION, 1])
             except Exception as e_res:
                 logger.warning(f"Residual error map figure generation skipped: {e_res}")
 
@@ -703,12 +749,20 @@ class LunaMatchPipeline:
                 'elapsed_s'            : round(time.time() - self._start_time, 2),
                 'transform'            : transform_type,
                 'transform_type'       : transform_type,
+                'transform_readable'   : transform_readable,
                 'condition_number'     : round(float(condition_number), 2) if condition_number is not None and not np.isinf(condition_number) else None,
                 'is_synthetic_fallback': False,
                 'stage_timings_ms'     : self.stage_timings_ms,
                 'craters_detected_a'   : len(craters_a),
                 'craters_detected_b'   : len(craters_b),
             }
+
+            # Ensure background image writes complete
+            for fut in _bg_futures:
+                try:
+                    fut.result(timeout=2.0)
+                except Exception as e_bg:
+                    logger.warning(f"Background write error: {e_bg}")
 
             with open(self.paths['metrics'], 'w') as f:
                 json.dump(metrics, f, indent=2)
@@ -726,4 +780,13 @@ class LunaMatchPipeline:
             err = f"Step 7 (Warp & Eval) failed: {traceback.format_exc()}"
             logger.error(err)
             self._write_status(JobState.FAILED, err)
-            return {'status': 'FAILED', 'stage': 'warp_and_eval', 'error': str(e)}
+            fail_metrics = {
+                'status': 'FAILED',
+                'error_code': ErrorCode.INTERNAL_ERROR.value,
+                'stage': 'warp_and_eval',
+                'error': str(e),
+                'is_synthetic_fallback': False,
+            }
+            with open(self.paths['metrics'], 'w') as f:
+                json.dump(fail_metrics, f, indent=2)
+            return fail_metrics

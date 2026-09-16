@@ -294,16 +294,18 @@ def extract_structural_features(image: np.ndarray, n_scales: int = 3, n_orientat
     dict with keys: pc_map, mim, edge_map, corner_map, amp_per_o
     """
     if mode == "fast":
-        # Fast path: 3 scales × 4 orientations = 12 FFTs per image (vs 18 in standard)
-        # Reduces FFT computation by ~33% on fast mode path ONLY.
+        # Fast path: 2 scales × 4 orientations = 8 FFTs per image (vs 18 in standard)
+        # Reduces FFT computation by >55% on fast mode path ONLY.
         # Standard mode is absolutely unchanged.
+        n_scales_eff = 2
         n_orientations_eff = 4
     else:
         # Standard mode: exactly as before (3 scales × 6 orientations)
+        n_scales_eff = n_scales
         n_orientations_eff = n_orientations  # default=6
 
     pc_per_o, amp_per_o = _phase_congruency_per_orientation(
-        image, n_scales=n_scales, n_orientations=n_orientations_eff
+        image, n_scales=n_scales_eff, n_orientations=n_orientations_eff
     )
     pc_map = np.clip(pc_per_o.sum(axis=0) / n_orientations_eff, 0, 1)
     edge_map, corner_map = moment_analysis(pc_per_o)

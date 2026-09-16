@@ -43,6 +43,8 @@ except ImportError:
     _HAS_CV2 = False
     logger.warning("OpenCV not installed; warp_image will use scipy/numpy fallback.")
 
+from core.geometric_verification import decompose_transform_readable
+
 
 def warp_image(
     source_img: np.ndarray,

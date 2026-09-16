@@ -42,17 +42,23 @@ def main():
 
     all_results = {}
 
+    import argparse
+    parser = argparse.ArgumentParser(description="Benchmark sampledataset pairs")
+    parser.add_argument("--mode", choices=["fast", "standard"], default="fast", help="Performance tier (fast or standard)")
+    args = parser.parse_args()
+    mode = args.mode
+
     print("=" * 80)
-    print(" LUNA-MATCH: BENCHMARKING ALL 9 REAL PAIRS IN sampledataset/")
+    print(f" LUNA-MATCH: BENCHMARKING ALL 9 REAL PAIRS IN sampledataset/ (mode={mode})")
     print("=" * 80)
 
     for name, path_a, path_b, diff in pairs:
-        print(f"\n>>> Running {name}: {path_a.name} vs {path_b.name} [{diff}]")
+        print(f"\n>>> Running {name}: {path_a.name} vs {path_b.name} [{diff}] (mode={mode})")
         t0 = time.time()
         job_id = f"bench_{name.lower().replace(' ', '_')}"
 
         try:
-            pipeline = LunaMatchPipeline(job_id, str(path_a), str(path_b))
+            pipeline = LunaMatchPipeline(job_id, str(path_a), str(path_b), mode=mode)
             result = pipeline.run()
             elapsed = round(time.time() - t0, 3)
             result["bench_elapsed_s"] = elapsed
@@ -108,7 +114,7 @@ def main():
 
     # Print markdown summary table
     print("\n" + "=" * 100)
-    print("SUMMARY TABLE")
+    print("SUMMARY METRICS TABLE")
     print("=" * 100)
     headers = ["Pair", "Status", "Elapsed(s)", "RMSE(px)", "Held-Out RMSE", "Overfit Ratio", "MAE(px)", "SSIM", "NCC", "Inliers", "SDI", "Transform", "Kappa"]
     print(f"| {' | '.join(headers)} |")
@@ -142,6 +148,40 @@ def main():
         print(f"| {' | '.join(row)} |")
     print("=" * 100)
 
+    # Print per-stage timing breakdown table
+    print("\n" + "=" * 115)
+    print(f"PER-STAGE TIMING BREAKDOWN TABLE (mode={mode})")
+    print("=" * 115)
+    stage_headers = ["Pair", "Status", "Preproc", "Overlap", "PC+MIM", "Crater", "Match", "ANMS", "Verif", "Refine", "ValSplit", "WarpEval", "Total Pipe", "Wall Time"]
+    print(f"| {' | '.join(stage_headers)} |")
+    print(f"| {' | '.join(['---'] * len(stage_headers))} |")
+    for name, path_a, path_b, diff in pairs:
+        res_info = all_results.get(name, {})
+        res = res_info.get("result", {})
+        status = res_info.get("status", "FAIL")
+        st = res.get("stage_timings_ms", {})
+        wall_s = res.get("bench_elapsed_s", "-")
+        wall_str = f"{wall_s:.2f}s" if isinstance(wall_s, (int, float)) else str(wall_s)
+        row = [
+            name,
+            status,
+            f"{st.get('preprocessing_ms', '-')}ms",
+            f"{st.get('overlap_check_ms', '-')}ms",
+            f"{st.get('phase_congruency_ms', '-')}ms",
+            f"{st.get('crater_detection_ms', '-')}ms",
+            f"{st.get('dense_matching_ms', '-')}ms",
+            f"{st.get('anms_ms', '-')}ms",
+            f"{st.get('verification_ms', '-')}ms",
+            f"{st.get('refinement_ms', '-')}ms",
+            f"{st.get('validation_split_ms', '-')}ms",
+            f"{st.get('warp_and_eval_ms', '-')}ms",
+            f"{st.get('total_pipeline_ms', '-')}ms",
+            wall_str,
+        ]
+        print(f"| {' | '.join(row)} |")
+    print("=" * 115)
+
 
 if __name__ == "__main__":
     main()
+

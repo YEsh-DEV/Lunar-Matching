@@ -74,3 +74,57 @@ def test_roma_stub_raises_not_implemented():
     """RoMa model loader raises NotImplementedError as specified in hackathon contract."""
     with pytest.raises(NotImplementedError):
         load_roma_model()
+
+
+def test_loftr_isolation_and_loftr_unavailable_error(monkeypatch):
+    """
+    Priority 2: When matching_method='loftr' is invoked and dependencies are missing,
+    it must raise LoFTRUnavailableError with error_code='LOFTR_UNAVAILABLE'.
+    """
+    import builtins
+    from core.dense_matcher import run_dense_matching, LoFTRUnavailableError
+
+    img_a = np.random.rand(64, 64)
+    img_b = np.random.rand(64, 64)
+
+    # Simulate missing torch/kornia
+    orig_import = builtins.__import__
+    def mock_import(name, *args, **kwargs):
+        if name in ('torch', 'kornia'):
+            raise ImportError(f"No module named '{name}' (simulated missing dependency)")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', mock_import)
+
+    with pytest.raises(LoFTRUnavailableError) as exc_info:
+        run_dense_matching(img_a, img_b, method='loftr')
+
+    assert exc_info.value.error_code == "LOFTR_UNAVAILABLE"
+    assert "LOFTR_UNAVAILABLE" in str(exc_info.value.error_code)
+
+
+def test_classical_path_unaffected_by_missing_loftr_deps(monkeypatch):
+    """
+    Priority 2: Classical default path must run cleanly even when torch/kornia
+    are completely absent, without any import attempts or latency overhead.
+    """
+    import builtins
+    from core.dense_matcher import run_dense_matching
+
+    # Simulate missing torch/kornia
+    orig_import = builtins.__import__
+    def mock_import(name, *args, **kwargs):
+        if name in ('torch', 'kornia'):
+            raise ImportError(f"No module named '{name}' (simulated missing dependency)")
+        return orig_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', mock_import)
+
+    img_a = np.random.rand(64, 64)
+    img_b = img_a.copy()
+
+    # Classical matching must succeed with zero error
+    matches = run_dense_matching(img_a, img_b, method='classical')
+    assert isinstance(matches, np.ndarray)
+    assert matches.shape[1] == 5
+

@@ -4,10 +4,16 @@ core/dense_matcher.py
 Dense & Semi-Dense Feature Matching Module for Planetary Remote Sensing.
 
 Implements:
-  - Classical robust fallback (SIFT + Lowe's ratio test + ORB safety net)
-  - LoFTR (Local Feature TRansformer) detector-free matching via kornia
+  - Classical robust matcher (SIFT + Lowe's ratio test + ORB safety net) [DEFAULT, <1s latency]
+  - LoFTR (Local Feature TRansformer) detector-free matching via kornia [OPT-IN, OFFLINE/GPU ONLY]
   - RoMa (Robust Dense Feature Matching) interface stub
   - Automatic matcher selection based on GSD scale disparity
+
+NOTE ON LOFTR DEEP-MATCHER PATH:
+The LoFTR matching path is strictly opt-in (matching_method='loftr') and completely isolated.
+It is intended solely for offline/GPU-available deployments and is EXPLICITLY EXCLUDED
+from the <1s latency guarantee. The default path (matching_method='classical') does
+not import torch or kornia and is optimized for sub-1s CPU execution.
 
 Interface contract:
   Returns (N, 5) float64 array: [x1, y1, x2, y2, confidence]
@@ -34,20 +40,34 @@ except ImportError:
     _HAS_CV2 = False
     logger.warning("OpenCV not installed; dense_matcher will use synthetic fallback.")
 
-# Try importing PyTorch & Kornia
-try:
-    import torch
-    import kornia
-    from kornia.feature import LoFTR
-    _HAS_KORNIA = True
-except ImportError:
-    _HAS_KORNIA = False
-    logger.warning("PyTorch/Kornia not installed; LoFTR will fall back to classical SIFT.")
+
+class LoFTRUnavailableError(RuntimeError):
+    """Raised when LoFTR deep matching is requested but torch/kornia dependencies are missing."""
+    error_code = "LOFTR_UNAVAILABLE"
+
+
+def _check_loftr_available() -> Tuple[object, object]:
+    """
+    Lazy-check and import PyTorch and Kornia for LoFTR.
+    Never called during module import or classical matching.
+    """
+    try:
+        import torch
+        import kornia
+        from kornia.feature import LoFTR
+        return torch, LoFTR
+    except ImportError as e:
+        raise LoFTRUnavailableError(
+            f"LoFTR deep matcher requires 'torch' and 'kornia' packages. "
+            f"Install them via pip install torch kornia, or use matching_method='classical'. "
+            f"Original import error: {e}"
+        ) from e
 
 
 def load_loftr_model(weights_path: Optional[str] = None, device: str = 'cpu') -> Optional[object]:
     """
     Load pre-trained LoFTR model via Kornia.
+    Lazy-loads torch/kornia on demand.
 
     Parameters
     ----------
@@ -58,9 +78,7 @@ def load_loftr_model(weights_path: Optional[str] = None, device: str = 'cpu') ->
     -------
     model : LoFTR instance or None if loading fails
     """
-    if not _HAS_KORNIA:
-        logger.info("Kornia not available; LoFTR model cannot be loaded.")
-        return None
+    torch, LoFTR = _check_loftr_available()
 
     try:
         if weights_path is not None:
@@ -329,9 +347,10 @@ def run_dense_matching(
     Execute dense/semi-dense image correspondence.
 
     Dispatches to:
+      - 'classical' : Classical SIFT with Lowe's ratio test (default, <1s latency)
       - 'structural': RIFT-style Phase Congruency / MIM structural matching
-      - 'classical' : Classical SIFT with Lowe's ratio test (and LoFTR if model provided)
       - 'hybrid'    : Try structural matching first; fallback to classical if < 8 matches
+      - 'loftr'     : LoFTR deep matcher via Kornia (explicit opt-in, offline/GPU only)
 
     Parameters
     ----------
@@ -339,7 +358,7 @@ def run_dense_matching(
     img_b             : (H, W) float64 ndarray
     model             : optional pre-loaded matcher model (LoFTR)
     confidence_thresh : minimum match confidence [0.0, 1.0]
-    method            : 'classical', 'structural', or 'hybrid' (default: 'classical')
+    method            : 'classical', 'structural', 'hybrid', or 'loftr' (default: 'classical')
     feats_a, feats_b  : optional precomputed structural features
 
     Returns
@@ -347,6 +366,40 @@ def run_dense_matching(
     matches : (N, 5) float64 array of [x1, y1, x2, y2, confidence]
     """
     method_lower = method.lower()
+
+    if method_lower == 'loftr':
+        # Priority 2: Strictly opt-in LoFTR path, completely isolated from classical
+        torch, LoFTR = _check_loftr_available()
+
+        if model is None:
+            model = load_loftr_model(device='cpu')
+            if model is None:
+                raise LoFTRUnavailableError("Failed to initialize LoFTR model instance.")
+
+        device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
+        t_a = torch.from_numpy(img_a).float().unsqueeze(0).unsqueeze(0).to(device)
+        t_b = torch.from_numpy(img_b).float().unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            input_dict = {"image0": t_a, "image1": t_b}
+            pred = model(input_dict)
+
+        kpts0 = pred['keypoints0'].cpu().numpy()
+        kpts1 = pred['keypoints1'].cpu().numpy()
+        conf = pred['confidence'].cpu().numpy()
+
+        mask = conf >= confidence_thresh
+        if np.sum(mask) >= 8:
+            pts0 = kpts0[mask]
+            pts1 = kpts1[mask]
+            scores = conf[mask]
+            matches = np.column_stack([pts0[:, 0], pts0[:, 1], pts1[:, 0], pts1[:, 1], scores])
+            logger.info(f"Matcher executed: LoFTR ({len(matches)} correspondences)")
+            return matches.astype(np.float64)
+        else:
+            logger.warning(f"LoFTR found only {np.sum(mask)} correspondences (need >= 8).")
+            return np.empty((0, 5), dtype=np.float64)
+
     if method_lower == 'structural':
         return run_structural_matching(
             img_a, img_b,
@@ -365,31 +418,5 @@ def run_dense_matching(
             return s_matches
         logger.info(f"Hybrid matcher: structural found {len(s_matches)} (< 8); falling back to classical SIFT/ORB")
 
-    # Try LoFTR if model provided or Kornia available
-    if model is not None and _HAS_KORNIA:
-        try:
-            device = next(model.parameters()).device if hasattr(model, 'parameters') else 'cpu'
-            t_a = torch.from_numpy(img_a).float().unsqueeze(0).unsqueeze(0).to(device)
-            t_b = torch.from_numpy(img_b).float().unsqueeze(0).unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                input_dict = {"image0": t_a, "image1": t_b}
-                pred = model(input_dict)
-
-            kpts0 = pred['keypoints0'].cpu().numpy()
-            kpts1 = pred['keypoints1'].cpu().numpy()
-            conf = pred['confidence'].cpu().numpy()
-
-            mask = conf >= confidence_thresh
-            if np.sum(mask) >= 8:
-                pts0 = kpts0[mask]
-                pts1 = kpts1[mask]
-                scores = conf[mask]
-                matches = np.column_stack([pts0[:, 0], pts0[:, 1], pts1[:, 0], pts1[:, 1], scores])
-                logger.info(f"Matcher executed: LoFTR ({len(matches)} correspondences)")
-                return matches.astype(np.float64)
-        except Exception as e:
-            logger.warning(f"LoFTR inference failed ({e}); falling back to classical SIFT.")
-
-    # Primary reliable classical path
+    # Primary reliable classical path (zero torch/kornia dependency)
     return _run_classical_matching(img_a, img_b, confidence_thresh=confidence_thresh)

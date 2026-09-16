@@ -13,6 +13,8 @@ class RegisterRequest(BaseModel):
     img_a_path: str = Field(..., description="Absolute path or URI to moving/source image (Chandrayaan-2 OHRC/TMC-2/IIRS)")
     img_b_path: str = Field(..., description="Absolute path or URI to reference image (LRO NAC / SELENE)")
     job_id: Optional[str] = Field(None, description="Optional custom job identifier; UUID generated if omitted")
+    matching_method: str = Field("classical", description="Matching method: 'classical' (default) or 'loftr'")
+    mode: str = Field("standard", description="Performance tier: 'standard' (default) or 'fast'")
 
 
 class JobStatusResponse(BaseModel):
@@ -34,6 +36,7 @@ class JobResultResponse(BaseModel):
     n_total: Optional[int] = None
     elapsed_s: Optional[float] = None
     transform: Optional[str] = None
+    transform_readable: Optional[Dict[str, float]] = None
     error: Optional[str] = None
     output_files: Optional[Dict[str, str]] = None
 
@@ -50,6 +53,7 @@ class MetricsSchema(BaseModel):
     inlier_ratio: Optional[float] = None
     sdi: Optional[float] = None
     transform_type: Optional[str] = None
+    transform_readable: Optional[Dict[str, float]] = None
     n_inliers: int = 0
     n_total: int = 0
     elapsed_s: float = 0.0

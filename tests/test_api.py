@@ -8,6 +8,7 @@ import os
 import sys
 import shutil
 import tempfile
+from pathlib import Path
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -173,4 +174,49 @@ def test_api_export_nonexistent_job(client):
     """GET /jobs/{id}/export for nonexistent job returns 404."""
     resp = client.get("/jobs/completely_nonexistent_job_123/export?kind=control_points")
     assert resp.status_code == 404
+    data = resp.json()
+    assert data["error_code"] == "JOB_NOT_FOUND"
+    assert "job_id" in data
+    assert "message" in data
+
+
+def test_api_structured_error_taxonomy_contract(client):
+    """
+    Priority 3: Every non-2xx API response body must be
+    {"error_code": str, "message": str, "job_id": str|null}
+    """
+    from api.errors import ErrorCode
+
+    # 1. Invalid input path -> 400 INVALID_INPUT_PATH
+    resp_bad_input = client.post("/register", json={
+        "img_a_path": "/nonexistent/path/to/a.tif",
+        "img_b_path": "/nonexistent/path/to/b.tif",
+        "job_id": "test_err_job_001",
+    })
+    assert resp_bad_input.status_code == 400
+    d1 = resp_bad_input.json()
+    assert d1["error_code"] == ErrorCode.INVALID_INPUT_PATH.value
+    assert d1["job_id"] == "test_err_job_001"
+    assert "message" in d1
+
+    # 2. Non-existent job -> 404 JOB_NOT_FOUND
+    resp_not_found = client.get("/jobs/nonexistent_xyz_888")
+    assert resp_not_found.status_code == 404
+    d2 = resp_not_found.json()
+    assert d2["error_code"] == ErrorCode.JOB_NOT_FOUND.value
+    assert d2["job_id"] == "nonexistent_xyz_888"
+
+    # 3. Invalid export kind -> 400 INVALID_KIND
+    job_id = "test_err_job_002"
+    job_dir = Path("data") / "jobs" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        resp_bad_kind = client.get(f"/jobs/{job_id}/export?kind=unsupported_format")
+        assert resp_bad_kind.status_code == 400
+        d3 = resp_bad_kind.json()
+        assert d3["error_code"] == ErrorCode.INVALID_KIND.value
+        assert d3["job_id"] == job_id
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
 
