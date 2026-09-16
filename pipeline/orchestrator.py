@@ -68,6 +68,7 @@ from core.warp_and_eval import (
     compute_inlier_ratio,
     compute_sdi,
     export_geotiff,
+    export_control_points_csv,
     generate_residual_error_map,
 )
 from core.crater_detection import detect_craters, render_crater_overlay
@@ -120,6 +121,7 @@ class LunaMatchPipeline:
             'residual_map'       : base / "output" / "residual_map.png",
             'craters_overlay_a'  : base / "output" / "craters_a.png",
             'craters_overlay_b'  : base / "output" / "craters_b.png",
+            'control_points_csv' : base / "output" / "control_points.csv",
             'metrics'            : base / "output" / "metrics.json",
         }
 
@@ -619,6 +621,12 @@ class LunaMatchPipeline:
             sdi          = compute_sdi(refined_matches, img_a.shape)
 
             export_geotiff(registered, self.paths['registered'], meta_a)
+
+            # Export verified + refined control points CSV
+            try:
+                export_control_points_csv(refined_matches, self.paths['control_points_csv'])
+            except Exception as e_csv:
+                logger.warning(f"Control points CSV export skipped: {e_csv}")
 
             # Generate 2D residual error heatmap figure
             try:

@@ -29,6 +29,7 @@ from pipeline.orchestrator import LunaMatchPipeline, JobState
 from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, SummaryResponse, ChatbotSummaryResponse
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
+from core.warp_and_eval import export_control_points_csv
 
 try:
     import rasterio
@@ -288,6 +289,44 @@ def get_job_summary(job_id: str):
     except Exception as e:
         logger.error(f"Failed to build summary for {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
+
+
+@app.get("/jobs/{job_id}/export")
+def export_job_data(job_id: str, kind: str = "control_points"):
+    """
+    Export job artifacts as downloadable files:
+      - kind='control_points' : returns CSV of verified + refined matches (x1, y1, x2, y2, confidence)
+    """
+    job_dir = Path("data") / "jobs" / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if kind == "control_points":
+        csv_path = job_dir / "output" / "control_points.csv"
+        if not csv_path.exists():
+            matches_file = job_dir / "intermediate" / "matches_verified.npy"
+            if not matches_file.exists():
+                matches_file = job_dir / "intermediate" / "matches_raw.npy"
+
+            if matches_file.exists():
+                try:
+                    matches = np.load(matches_file)
+                    export_control_points_csv(matches, csv_path)
+                except Exception as e_exp:
+                    raise HTTPException(status_code=500, detail=f"Failed to generate control points CSV: {e_exp}")
+            else:
+                raise HTTPException(status_code=404, detail="No control points found for this job")
+
+        return FileResponse(
+            str(csv_path),
+            media_type="text/csv",
+            filename=f"{job_id}_control_points.csv",
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported export kind: '{kind}'. Supported kinds: ['control_points']",
+    )
 
 
 @app.get("/jobs/{job_id}/preview")

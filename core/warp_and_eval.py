@@ -20,6 +20,7 @@ References:
 import os
 import math
 import logging
+from pathlib import Path
 from typing import Tuple, Optional, Union, Any, Dict
 import numpy as np
 
@@ -562,3 +563,30 @@ def build_metrics_report(
         'elapsed_s': round(float(elapsed_s), 2) if elapsed_s is not None else 0.0,
         'transform': str(transform) if transform is not None else "unknown",
     }
+
+
+def export_control_points_csv(
+    matches: np.ndarray,
+    out_path: Union[str, os.PathLike],
+) -> str:
+    """
+    Export verified and refined control point correspondences to a CSV file.
+    Writes columns: x1,y1,x2,y2,confidence
+    """
+    out_file = Path(out_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    matches_arr = np.asarray(matches, dtype=np.float64) if matches is not None else np.zeros((0, 5))
+    if matches_arr.ndim != 2 or matches_arr.shape[1] < 4:
+        matches_arr = np.zeros((0, 5), dtype=np.float64)
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write("x1,y1,x2,y2,confidence\n")
+        for row in matches_arr:
+            x1, y1, x2, y2 = row[:4]
+            conf = row[4] if len(row) > 4 else 1.0
+            f.write(f"{x1:.4f},{y1:.4f},{x2:.4f},{y2:.4f},{conf:.4f}\n")
+
+    logger.info(f"Exported {len(matches_arr)} control points to CSV: {out_file}")
+    return str(out_file)
+

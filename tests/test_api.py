@@ -6,6 +6,7 @@ Integration tests for the LUNA-MATCH FastAPI application.
 
 import os
 import sys
+import shutil
 import tempfile
 import numpy as np
 import pytest
@@ -120,3 +121,56 @@ def test_api_graphs_sfd_on_completed_job(client, synthetic_images, tmp_path):
     resp = client.get(f"/jobs/{job_id}/graphs?kind=sfd")
     # SFD with 0 craters should still return 200 (empty plot or JSON data)
     assert resp.status_code == 200
+
+
+def test_api_export_control_points(client):
+    """
+    GET /jobs/{id}/export?kind=control_points must return HTTP 200 with text/csv
+    and standard CSV header.
+    """
+    import shutil
+    job_id = "test_api_export_cp_001"
+    job_dir = os.path.join("data", "jobs", job_id)
+    os.makedirs(os.path.join(job_dir, "output"), exist_ok=True)
+    os.makedirs(os.path.join(job_dir, "intermediate"), exist_ok=True)
+
+    try:
+        # Create a mock matches_verified.npy
+        matches = np.array([
+            [10.0, 20.0, 12.0, 22.0, 0.95],
+            [30.0, 40.0, 32.0, 42.0, 0.88],
+        ])
+        np.save(os.path.join(job_dir, "intermediate", "matches_verified.npy"), matches)
+
+        resp = client.get(f"/jobs/{job_id}/export?kind=control_points")
+        assert resp.status_code == 200
+        assert "text/csv" in resp.headers.get("content-type", "")
+        content = resp.text
+        lines = [line.strip() for line in content.strip().split("\n")]
+        assert lines[0] == "x1,y1,x2,y2,confidence"
+        assert len(lines) == 3
+        assert lines[1].startswith("10.0000,20.0000,12.0000,22.0000,0.9500")
+
+    finally:
+        if os.path.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def test_api_export_invalid_kind(client):
+    """GET /jobs/{id}/export with invalid kind returns 400."""
+    job_id = "test_api_export_invalid_001"
+    job_dir = os.path.join("data", "jobs", job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        resp = client.get(f"/jobs/{job_id}/export?kind=invalid_kind")
+        assert resp.status_code == 400
+    finally:
+        if os.path.exists(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def test_api_export_nonexistent_job(client):
+    """GET /jobs/{id}/export for nonexistent job returns 404."""
+    resp = client.get("/jobs/completely_nonexistent_job_123/export?kind=control_points")
+    assert resp.status_code == 404
+
