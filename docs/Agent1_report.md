@@ -355,6 +355,20 @@ Once Agent 2 delivers these, the orchestrator stubs are automatically replaced b
 
 ## 10. Performance Targets (From Architecture Spec)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 | Metric | Target | How Agent 1 Achieves It |
 |--------|--------|------------------------|
 | RMSE (px) | < 1.0 px | LK sub-pixel refinement → verified < 0.35px in tests |
